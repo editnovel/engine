@@ -47,7 +47,7 @@ fn custom_cover_store() -> &'static RwLock<Option<ExtractedImage>> {
     CUSTOM_COVER.get_or_init(|| RwLock::new(None))
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendBookMetadata {
     pub title: String,
@@ -105,7 +105,7 @@ pub struct FrontendExtractedImage {
     pub image_type: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendEditorialRule {
     pub id: String,
@@ -115,7 +115,7 @@ pub struct FrontendEditorialRule {
     pub affected_count: usize,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendRegexRule {
     pub id: String,
@@ -126,7 +126,7 @@ pub struct FrontendRegexRule {
     pub affected_count: usize,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendGlossaryReplacement {
     pub id: String,
