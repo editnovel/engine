@@ -1,60 +1,168 @@
-use crate::models::{FrontendSpellCorrection, Paragraph, SpellTransformation};
+use crate::models::{FrontendSpellCorrection, Paragraph, Section, SpellTransformation};
+#[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use symspell::{SymSpell, SymSpellBuilder, UnicodeStringStrategy, Verbosity};
 
-const ES_FREQ_DICT: &str = include_str!("../data/dictionaries/es_frequency.txt");
-const EN_FREQ_DICT: &str = include_str!("../data/dictionaries/en_frequency.txt");
-const JA_ROMAJI_DICT: &str = include_str!("../data/dictionaries/ja_romaji_common.tsv");
+#[cfg(feature = "embedded-dicts")]
+const ES_FREQ_DICT_BYTES: &[u8] = include_bytes!("../data/dictionaries/es_frequency.txt");
+#[cfg(feature = "embedded-dicts")]
+const EN_FREQ_DICT_BYTES: &[u8] = include_bytes!("../data/dictionaries/en_frequency.txt");
+#[cfg(feature = "embedded-dicts")]
+const JA_ROMAJI_DICT_BYTES: &[u8] = include_bytes!("../data/dictionaries/ja_romaji_common.tsv");
 
-static SPANISH_SPELL: OnceLock<SymSpell<UnicodeStringStrategy>> = OnceLock::new();
-static ENGLISH_SPELL: OnceLock<SymSpell<UnicodeStringStrategy>> = OnceLock::new();
-static JAPANESE_ROMAJI_SET: OnceLock<HashSet<String>> = OnceLock::new();
+static SPANISH_SPELL: OnceLock<RwLock<Option<Arc<SymSpell<UnicodeStringStrategy>>>>> =
+    OnceLock::new();
+static ENGLISH_SPELL: OnceLock<RwLock<Option<Arc<SymSpell<UnicodeStringStrategy>>>>> =
+    OnceLock::new();
+static JAPANESE_ROMAJI_SET: OnceLock<RwLock<Option<Arc<HashSet<String>>>>> = OnceLock::new();
 
-fn get_spanish_spell() -> &'static SymSpell<UnicodeStringStrategy> {
-    SPANISH_SPELL.get_or_init(|| {
-        let mut symspell = SymSpellBuilder::default()
-            .max_dictionary_edit_distance(2)
-            .prefix_length(7)
-            .count_threshold(1)
-            .build()
-            .expect("Failed to build Spanish SymSpell");
-
-        for line in ES_FREQ_DICT.lines() {
-            symspell.load_dictionary_line(line, 0, 1, " ");
-        }
-        symspell
-    })
+fn spanish_spell_cell() -> &'static RwLock<Option<Arc<SymSpell<UnicodeStringStrategy>>>> {
+    SPANISH_SPELL.get_or_init(|| RwLock::new(None))
 }
 
-fn get_english_spell() -> &'static SymSpell<UnicodeStringStrategy> {
-    ENGLISH_SPELL.get_or_init(|| {
-        let mut symspell = SymSpellBuilder::default()
-            .max_dictionary_edit_distance(2)
-            .prefix_length(7)
-            .count_threshold(1)
-            .build()
-            .expect("Failed to build English SymSpell");
-
-        for line in EN_FREQ_DICT.lines() {
-            symspell.load_dictionary_line(line, 0, 1, " ");
-        }
-        symspell
-    })
+fn english_spell_cell() -> &'static RwLock<Option<Arc<SymSpell<UnicodeStringStrategy>>>> {
+    ENGLISH_SPELL.get_or_init(|| RwLock::new(None))
 }
 
-fn get_japanese_romaji_set() -> &'static HashSet<String> {
-    JAPANESE_ROMAJI_SET.get_or_init(|| {
-        let mut set = HashSet::new();
-        for line in JA_ROMAJI_DICT.lines() {
-            let term = line.split('\t').next().unwrap_or("").trim().to_lowercase();
-            if !term.is_empty() {
-                set.insert(term);
-            }
+fn japanese_romaji_cell() -> &'static RwLock<Option<Arc<HashSet<String>>>> {
+    JAPANESE_ROMAJI_SET.get_or_init(|| RwLock::new(None))
+}
+
+fn build_symspell_from_str(content: &str) -> Result<SymSpell<UnicodeStringStrategy>, String> {
+    let mut symspell = SymSpellBuilder::default()
+        .max_dictionary_edit_distance(2)
+        .prefix_length(7)
+        .count_threshold(1)
+        .build()
+        .map_err(|e| format!("Failed to build SymSpell: {:?}", e))?;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            symspell.load_dictionary_line(trimmed, 0, 1, " ");
         }
-        set
-    })
+    }
+    Ok(symspell)
+}
+
+fn build_romaji_set_from_str(content: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for line in content.lines() {
+        let term = line.split('\t').next().unwrap_or("").trim().to_lowercase();
+        if !term.is_empty() {
+            set.insert(term);
+        }
+    }
+    set
+}
+
+fn decode_dictionary_bytes(bytes: &[u8]) -> Result<String, String> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        let has_binary_ctrl = s
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t');
+        if !has_binary_ctrl {
+            return Ok(s.to_string());
+        }
+    }
+    let decompressed = crate::decompress_brotli(bytes)?;
+    String::from_utf8(decompressed).map_err(|e| e.to_string())
+}
+
+pub fn init_dictionary(lang: &str, bytes: &[u8]) -> Result<(), String> {
+    let content = decode_dictionary_bytes(bytes)?;
+    let norm = lang.trim().to_lowercase();
+    match norm.as_str() {
+        "es" | "es_frequency" | "spanish" => {
+            let symspell = Arc::new(build_symspell_from_str(&content)?);
+            let mut guard = spanish_spell_cell().write().map_err(|e| e.to_string())?;
+            *guard = Some(symspell);
+            Ok(())
+        }
+        "en" | "en_frequency" | "english" => {
+            let symspell = Arc::new(build_symspell_from_str(&content)?);
+            let mut guard = english_spell_cell().write().map_err(|e| e.to_string())?;
+            *guard = Some(symspell);
+            Ok(())
+        }
+        "ja" | "ja_romaji" | "romaji" | "ja-romaji" => {
+            let set = Arc::new(build_romaji_set_from_str(&content));
+            let mut guard = japanese_romaji_cell().write().map_err(|e| e.to_string())?;
+            *guard = Some(set);
+            Ok(())
+        }
+        _ => Err(format!("Unsupported dictionary language: {}", lang)),
+    }
+}
+
+fn get_spanish_spell() -> Arc<SymSpell<UnicodeStringStrategy>> {
+    if let Ok(guard) = spanish_spell_cell().read() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+    }
+    if let Ok(mut guard) = spanish_spell_cell().write() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+        #[cfg(feature = "embedded-dicts")]
+        let default_str = std::str::from_utf8(ES_FREQ_DICT_BYTES).unwrap_or("");
+        #[cfg(not(feature = "embedded-dicts"))]
+        let default_str = "";
+        let built = Arc::new(
+            build_symspell_from_str(default_str).expect("Failed to build Spanish SymSpell"),
+        );
+        *guard = Some(built.clone());
+        return built;
+    }
+    Arc::new(build_symspell_from_str("").expect("Failed to build empty SymSpell"))
+}
+
+fn get_english_spell() -> Arc<SymSpell<UnicodeStringStrategy>> {
+    if let Ok(guard) = english_spell_cell().read() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+    }
+    if let Ok(mut guard) = english_spell_cell().write() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+        #[cfg(feature = "embedded-dicts")]
+        let default_str = std::str::from_utf8(EN_FREQ_DICT_BYTES).unwrap_or("");
+        #[cfg(not(feature = "embedded-dicts"))]
+        let default_str = "";
+        let built = Arc::new(
+            build_symspell_from_str(default_str).expect("Failed to build English SymSpell"),
+        );
+        *guard = Some(built.clone());
+        return built;
+    }
+    Arc::new(build_symspell_from_str("").expect("Failed to build empty SymSpell"))
+}
+
+fn get_japanese_romaji_set() -> Arc<HashSet<String>> {
+    if let Ok(guard) = japanese_romaji_cell().read() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+    }
+    if let Ok(mut guard) = japanese_romaji_cell().write() {
+        if let Some(ref existing) = *guard {
+            return existing.clone();
+        }
+        #[cfg(feature = "embedded-dicts")]
+        let default_str = std::str::from_utf8(JA_ROMAJI_DICT_BYTES).unwrap_or("");
+        #[cfg(not(feature = "embedded-dicts"))]
+        let default_str = "";
+        let built = Arc::new(build_romaji_set_from_str(default_str));
+        *guard = Some(built.clone());
+        return built;
+    }
+    Arc::new(HashSet::new())
 }
 
 pub fn is_cjk_or_japanese(c: char) -> bool {
@@ -667,38 +775,132 @@ impl ContextualSpellCorrector {
         (frontend_corrections, transformations)
     }
 
+    pub fn audit_sections_parallel(
+        &self,
+        file_id: &str,
+        sections: &[Section],
+        volume_num: usize,
+        options: &SpellAuditOptions,
+    ) -> (Vec<FrontendSpellCorrection>, SpellAuditStats) {
+        #[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+        let per_section: Vec<(Vec<FrontendSpellCorrection>, SpellAuditStats)> = sections
+            .par_iter()
+            .map(|sec| {
+                let mut paras_clone = sec.paragraphs.clone();
+                let mut local_stats = SpellAuditStats::default();
+                let (corrs, _) = self.audit_section_paragraphs(
+                    file_id,
+                    &mut paras_clone,
+                    volume_num,
+                    sec.start_page,
+                    &sec.title,
+                    options,
+                    &mut local_stats,
+                    false,
+                    1,
+                );
+                (corrs, local_stats)
+            })
+            .collect();
+
+        #[cfg(all(not(feature = "parallel"), target_arch = "wasm32"))]
+        let per_section: Vec<(Vec<FrontendSpellCorrection>, SpellAuditStats)> = sections
+            .iter()
+            .map(|sec| {
+                let mut paras_clone = sec.paragraphs.clone();
+                let mut local_stats = SpellAuditStats::default();
+                let (corrs, _) = self.audit_section_paragraphs(
+                    file_id,
+                    &mut paras_clone,
+                    volume_num,
+                    sec.start_page,
+                    &sec.title,
+                    options,
+                    &mut local_stats,
+                    false,
+                    1,
+                );
+                (corrs, local_stats)
+            })
+            .collect();
+
+        let mut all_corrections = Vec::new();
+        let mut total_stats = SpellAuditStats::default();
+        let mut seq_idx = 1usize;
+
+        for (corrs, st) in per_section {
+            total_stats.ignored_japanese_count += st.ignored_japanese_count;
+            total_stats.ignored_foreign_count += st.ignored_foreign_count;
+            total_stats.ignored_proper_nouns_count += st.ignored_proper_nouns_count;
+            for mut c in corrs {
+                c.id = format!("spell-{}-{}-{}-0", file_id, volume_num, seq_idx);
+                seq_idx += 1;
+                all_corrections.push(c);
+            }
+        }
+
+        (all_corrections, total_stats)
+    }
+
     pub fn audit_dynamic_paragraphs(
         &self,
         request: &DynamicAuditRequest,
     ) -> Vec<FrontendSpellCorrection> {
-        let mut all_corrections = Vec::new();
-        let mut dummy_stats = SpellAuditStats::default();
+        #[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+        let per_para: Vec<Vec<FrontendSpellCorrection>> = request
+            .paragraphs
+            .par_iter()
+            .map(|dp| {
+                let mut paras = vec![Paragraph::new(dp.text.clone())];
+                let mut dummy_stats = SpellAuditStats::default();
+                let (mut f_corrs, _) = self.audit_section_paragraphs(
+                    &request.file_id,
+                    &mut paras,
+                    1,
+                    dp.page_num.max(1),
+                    &dp.section_title,
+                    &request.options,
+                    &mut dummy_stats,
+                    false,
+                    1,
+                );
+                for (c_idx, c) in f_corrs.iter_mut().enumerate() {
+                    c.id = format!("sp-dyn-{}-{}", dp.id, c_idx);
+                    c.paragraph_id = Some(dp.id.clone());
+                    c.section_title = dp.section_title.clone();
+                }
+                f_corrs
+            })
+            .collect();
 
-        for dp in &request.paragraphs {
-            let mut paras = vec![Paragraph::new(dp.text.clone())];
+        #[cfg(all(not(feature = "parallel"), target_arch = "wasm32"))]
+        let per_para: Vec<Vec<FrontendSpellCorrection>> = request
+            .paragraphs
+            .iter()
+            .map(|dp| {
+                let mut paras = vec![Paragraph::new(dp.text.clone())];
+                let mut dummy_stats = SpellAuditStats::default();
+                let (mut f_corrs, _) = self.audit_section_paragraphs(
+                    &request.file_id,
+                    &mut paras,
+                    1,
+                    dp.page_num.max(1),
+                    &dp.section_title,
+                    &request.options,
+                    &mut dummy_stats,
+                    false,
+                    1,
+                );
+                for (c_idx, c) in f_corrs.iter_mut().enumerate() {
+                    c.id = format!("sp-dyn-{}-{}", dp.id, c_idx);
+                    c.paragraph_id = Some(dp.id.clone());
+                    c.section_title = dp.section_title.clone();
+                }
+                f_corrs
+            })
+            .collect();
 
-            let (mut f_corrs, _) = self.audit_section_paragraphs(
-                &request.file_id,
-                &mut paras,
-                1,
-                dp.page_num.max(1),
-                &dp.section_title,
-                &request.options,
-                &mut dummy_stats,
-                false,
-                1,
-            );
-
-            for (c_idx, c) in f_corrs.iter_mut().enumerate() {
-                c.id = format!("sp-dyn-{}-{}", dp.id, c_idx);
-                c.paragraph_id = Some(dp.id.clone());
-                c.section_title = dp.section_title.clone();
-            }
-
-            all_corrections.append(&mut f_corrs);
-        }
-
-        all_corrections
+        per_para.into_iter().flatten().collect()
     }
 
     pub fn analyze_and_correct_paragraphs(

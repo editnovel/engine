@@ -9,24 +9,41 @@ pub mod spell_corrector;
 pub mod templates;
 pub mod text_utils;
 
-use crate::config::{infer_series_and_volume, LANGUAGE};
+use crate::config::{
+    infer_series_and_volume, resolve_language, LanguageProfile, ParseOptions, PresetProfile,
+};
 use crate::epub_builder::EpubBuilder;
-use crate::models::{ContentItem, ContentItemPayload, ExtractedImage, Paragraph, Section, VolumeInfo};
+use crate::models::{
+    ocr_page_to_pdf_page_data, ContentItem, ContentItemPayload, ExtractedImage, OcrPageInput,
+    Paragraph, PdfPageData, Section, VolumeInfo,
+};
+use crate::pdf_extractor::{detect_scanned_pages_from_pages, ParsedPdfDocument};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use lol_html::{element, html_content::ContentType, rewrite_str, text, RewriteStrSettings};
+use rc_zip_sync::ReadZip;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read};
-use zip::ZipArchive;
+use std::io::Cursor;
+use std::sync::{Arc, OnceLock, RwLock};
 
-struct StoredVolume {
-    volume: VolumeInfo,
-    section_ids: Vec<String>,
+pub struct StoredVolume {
+    pub volume: VolumeInfo,
+    pub section_ids: Vec<String>,
+    pub raw_pages: Vec<PdfPageData>,
+    pub scanned_page_numbers: Vec<usize>,
 }
 
-thread_local! {
-    static LOADED_VOLUMES: RefCell<HashMap<String, StoredVolume>> = RefCell::new(HashMap::new());
-    static CUSTOM_COVER: RefCell<Option<ExtractedImage>> = RefCell::new(None);
+static LOADED_VOLUMES: OnceLock<RwLock<HashMap<String, Arc<StoredVolume>>>> = OnceLock::new();
+static CUSTOM_COVER: OnceLock<RwLock<Option<ExtractedImage>>> = OnceLock::new();
+
+fn loaded_volumes_store() -> &'static RwLock<HashMap<String, Arc<StoredVolume>>> {
+    LOADED_VOLUMES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn custom_cover_store() -> &'static RwLock<Option<ExtractedImage>> {
+    CUSTOM_COVER.get_or_init(|| RwLock::new(None))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -128,6 +145,10 @@ pub struct WasmParsedBookPayload {
     pub ignored_japanese_count: usize,
     pub ignored_foreign_count: usize,
     pub ignored_proper_nouns_count: usize,
+    #[serde(default)]
+    pub needs_ocr: bool,
+    #[serde(default)]
+    pub scanned_page_numbers: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -242,63 +263,136 @@ fn compute_detected_rules(vol: &VolumeInfo) -> Vec<FrontendEditorialRule> {
     ]
 }
 
-fn parse_epub_bytes(epub_bytes: &[u8], filename: &str) -> Result<VolumeInfo, String> {
-    let reader = Cursor::new(epub_bytes);
-    let mut archive = ZipArchive::new(reader).map_err(|e| e.to_string())?;
+struct EpubParseRegexes {
+    title_re: Regex,
+    vol_re: Regex,
+    pub_re: Regex,
+    desc_re: Regex,
+    tag_strip_re: Regex,
+    h1_re: Regex,
+    h2_re: Regex,
+    block_re: Regex,
+    bold_tag_re: Regex,
+    span_bold_re: Regex,
+}
+
+static EPUB_PARSE_REGEXES: OnceLock<EpubParseRegexes> = OnceLock::new();
+
+fn get_epub_parse_regexes() -> &'static EpubParseRegexes {
+    EPUB_PARSE_REGEXES.get_or_init(|| EpubParseRegexes {
+        title_re: Regex::new(r"(?s)<dc:title[^>]*>(.*?)</dc:title>").unwrap(),
+        vol_re: Regex::new(r"(?i)(?:Volumen|Volume|Vol\.?)\s+(\d+)").unwrap(),
+        pub_re: Regex::new(r"(?s)<dc:publisher[^>]*>(.*?)</dc:publisher>").unwrap(),
+        desc_re: Regex::new(r"(?s)<dc:description[^>]*>(.*?)</dc:description>").unwrap(),
+        tag_strip_re: Regex::new(r"<[^>]+>").unwrap(),
+        h1_re: Regex::new(r"(?s)<h1[^>]*>(.*?)</h1>").unwrap(),
+        h2_re: Regex::new(r"(?s)<h2[^>]*>(.*?)</h2>").unwrap(),
+        block_re: Regex::new(
+            r#"(?is)<(?P<tag>p|div|hr)\b(?P<attrs>[^>]*)>(?:(?P<content>.*?)</(?:p|div)>)?"#,
+        )
+        .unwrap(),
+        bold_tag_re: Regex::new(r"(?is)<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>").unwrap(),
+        span_bold_re: Regex::new(
+            r#"(?is)<span\b[^>]*style="[^"]*font-weight:\s*(?:bold|[6-9]00)[^"]*"[^>]*>(.*?)</span>"#,
+        )
+        .unwrap(),
+    })
+}
+
+pub fn read_zip_entries_rc(zip_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
+    let archive = zip_bytes.read_zip().map_err(|e| e.to_string())?;
+    let mut map = HashMap::new();
+    for entry in archive.entries() {
+        let data = entry.bytes().map_err(|e| e.to_string())?;
+        map.insert(entry.name.to_string(), data);
+    }
+    Ok(map)
+}
+
+pub fn parse_epub_bytes(epub_bytes: &[u8], filename: &str) -> Result<VolumeInfo, String> {
+    let (vol, _) = parse_epub_bytes_with_options(epub_bytes, filename, &ParseOptions::default())?;
+    Ok(vol)
+}
+
+pub fn parse_epub_bytes_with_options(
+    epub_bytes: &[u8],
+    filename: &str,
+    options: &ParseOptions,
+) -> Result<(VolumeInfo, String), String> {
+    let archive = epub_bytes.read_zip().map_err(|e| e.to_string())?;
+    let rx = get_epub_parse_regexes();
 
     let mut opf_content = String::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().map_err(|e| e.to_string())?.to_string();
-        if name.ends_with(".opf") {
-            f.read_to_string(&mut opf_content).map_err(|e| e.to_string())?;
+    let mut editnovel_manifest = String::new();
+    for entry in archive.entries() {
+        if entry.name.ends_with(".opf") {
+            let bytes = entry.bytes().map_err(|e| e.to_string())?;
+            opf_content = String::from_utf8_lossy(&bytes).to_string();
             break;
+        } else if entry.name == "manifest.json" {
+            let bytes = entry.bytes().map_err(|e| e.to_string())?;
+            editnovel_manifest = String::from_utf8_lossy(&bytes).to_string();
         }
     }
 
-    let title_re = Regex::new(r"(?s)<dc:title[^>]*>(.*?)</dc:title>").unwrap();
-    let title = title_re
+    let mut title = rx
+        .title_re
         .captures(&opf_content)
         .map(|c| c[1].trim().to_string())
-        .unwrap_or_else(|| filename.replace(".epub", ""));
+        .unwrap_or_else(|| {
+            filename
+                .trim_end_matches(".epub")
+                .trim_end_matches(".editnovel")
+                .to_string()
+        });
 
-    let vol_re = Regex::new(r"(?i)Volumen\s+(\d+)").unwrap();
-    let vol_num = vol_re
+    if opf_content.is_empty() && !editnovel_manifest.is_empty() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&editnovel_manifest) {
+            if let Some(t) = val
+                .get("title")
+                .or_else(|| val.get("metadata").and_then(|m| m.get("title")))
+                .and_then(|v| v.as_str())
+            {
+                if !t.trim().is_empty() {
+                    title = t.trim().to_string();
+                }
+            }
+        }
+    }
+
+    let vol_num = rx
+        .vol_re
         .captures(&title)
-        .or_else(|| vol_re.captures(filename))
+        .or_else(|| rx.vol_re.captures(filename))
         .and_then(|c| c[1].parse::<usize>().ok())
         .unwrap_or(1);
 
-    let pub_re = Regex::new(r"(?s)<dc:publisher[^>]*>(.*?)</dc:publisher>").unwrap();
-    let extracted_publisher = pub_re
+    let extracted_publisher = rx
+        .pub_re
         .captures(&opf_content)
         .map(|c| c[1].trim().to_string())
         .filter(|p| !p.is_empty() && p != "Agnostic EPUB Converter");
 
-    let desc_re = Regex::new(r"(?s)<dc:description[^>]*>(.*?)</dc:description>").unwrap();
-    let mut extracted_description = desc_re
+    let mut extracted_description = rx
+        .desc_re
         .captures(&opf_content)
-        .map(|c| {
-            let tag_strip_re = Regex::new(r"<[^>]+>").unwrap();
-            tag_strip_re.replace_all(&c[1], "").trim().to_string()
-        })
+        .map(|c| rx.tag_strip_re.replace_all(&c[1], "").trim().to_string())
         .filter(|d| !d.is_empty());
 
     let mut cover_image: Option<ExtractedImage> = None;
     let mut color_images: Vec<ExtractedImage> = Vec::new();
     let mut all_verdicts: Vec<ExtractedImage> = Vec::new();
+    let mut xhtml_entries: Vec<(String, String)> = Vec::new();
 
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().map_err(|e| e.to_string())?.to_string();
+    for entry in archive.entries() {
+        let name = entry.name.to_string();
         let lower = name.to_lowercase();
         if lower.ends_with(".jpg")
             || lower.ends_with(".jpeg")
             || lower.ends_with(".png")
             || lower.ends_with(".webp")
         {
-            let mut data = Vec::new();
-            f.read_to_end(&mut data).map_err(|e| e.to_string())?;
+            let data = entry.bytes().map_err(|e| e.to_string())?;
             let (width, height) = image::ImageReader::new(Cursor::new(&data))
                 .with_guessed_format()
                 .ok()
@@ -314,10 +408,17 @@ fn parse_epub_bytes(epub_bytes: &[u8], filename: &str) -> Result<VolumeInfo, Str
                 .and_then(|s| s.to_str())
                 .unwrap_or(&name)
                 .to_string();
-            let is_cov = cover_image.is_none() && (short_name.contains("p001") || short_name.contains("cover") || all_verdicts.is_empty());
+            let is_cov = cover_image.is_none()
+                && (short_name.contains("p001")
+                    || short_name.contains("cover")
+                    || all_verdicts.is_empty());
             let cat = if is_cov {
                 "covers"
-            } else if short_name.contains("p002") || short_name.contains("p003") || short_name.contains("p004") || short_name.contains("color") {
+            } else if short_name.contains("p002")
+                || short_name.contains("p003")
+                || short_name.contains("p004")
+                || short_name.contains("color")
+            {
                 "color_inserts"
             } else {
                 "story_illustrations"
@@ -343,94 +444,108 @@ fn parse_epub_bytes(epub_bytes: &[u8], filename: &str) -> Result<VolumeInfo, Str
                 color_images.push(img.clone());
             }
             all_verdicts.push(img);
-        }
-    }
-
-    let mut xhtml_entries: Vec<(String, String)> = Vec::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = f.name().map_err(|e| e.to_string())?.to_string();
-        if (name.ends_with(".xhtml") || name.ends_with(".html"))
+        } else if (name.ends_with(".xhtml") || name.ends_with(".html"))
             && !name.ends_with("nav.xhtml")
             && !name.contains("cover")
             && !name.contains("color_")
             && !name.contains("colophon")
             && !name.contains("_title")
+            && !name.contains("titlepage")
         {
-            let mut text = String::new();
-            if f.read_to_string(&mut text).is_ok() {
-                xhtml_entries.push((name, text));
+            if let Ok(bytes) = entry.bytes() {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    xhtml_entries.push((name, text));
+                }
             }
         }
     }
     xhtml_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let h1_re = Regex::new(r"(?s)<h1[^>]*>(.*?)</h1>").unwrap();
-    let h2_re = Regex::new(r"(?s)<h2[^>]*>(.*?)</h2>").unwrap();
-    let block_re = Regex::new(
-        r#"(?is)<(?P<tag>p|div|hr)\b(?P<attrs>[^>]*)>(?:(?P<content>.*?)</(?:p|div)>)?"#,
-    )
-    .unwrap();
-    let tag_re = Regex::new(r"<[^>]+>").unwrap();
-    let bold_tag_re = Regex::new(r"(?is)<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>").unwrap();
-    let span_bold_re = Regex::new(
-        r#"(?is)<span\b[^>]*style="[^"]*font-weight:\s*(?:bold|[6-9]00)[^"]*"[^>]*>(.*?)</span>"#,
-    )
-    .unwrap();
-    let cleaner = crate::cleaner::TextCleaner::new();
+    let sample_text: String = xhtml_entries
+        .iter()
+        .take(5)
+        .map(|(_, t)| rx.tag_strip_re.replace_all(t, " ").into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let resolved_lang = resolve_language(&options.language, &sample_text, &options.preset_id);
+    let preset = PresetProfile::from_id(&options.preset_id);
+    let lang_profile = LanguageProfile::for_language(resolved_lang);
+    let cleaner = crate::cleaner::TextCleaner::with_profiles(lang_profile, preset);
 
     let mut sections: Vec<Section> = Vec::new();
     for (idx, (_, xhtml)) in xhtml_entries.into_iter().enumerate() {
-        let h1 = h1_re
+        let default_h1 = if resolved_lang == "en" {
+            format!("Chapter {}", idx + 1)
+        } else {
+            format!("Capítulo {}", idx + 1)
+        };
+        let h1 = rx
+            .h1_re
             .captures(&xhtml)
-            .map(|c| tag_re.replace_all(&c[1], "").trim().to_string())
-            .unwrap_or_else(|| format!("Capítulo {}", idx + 1));
-        let h2 = h2_re
+            .map(|c| rx.tag_strip_re.replace_all(&c[1], "").trim().to_string())
+            .unwrap_or(default_h1);
+        let h2 = rx
+            .h2_re
             .captures(&xhtml)
-            .map(|c| tag_re.replace_all(&c[1], "").trim().to_string());
+            .map(|c| rx.tag_strip_re.replace_all(&c[1], "").trim().to_string());
         let full_title = match h2 {
             Some(ref sub) if !sub.is_empty() => format!("{}: {}", h1, sub),
             _ => h1,
         };
         let mut sec = Section::new(full_title, h2, idx + 1, idx + 1);
         sec.section_type = Some(classify_section_type(&sec.title).to_string());
-        for cap in block_re.captures_iter(&xhtml) {
-            let tag = cap.name("tag").map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        for cap in rx.block_re.captures_iter(&xhtml) {
+            let tag = cap
+                .name("tag")
+                .map(|m| m.as_str().to_lowercase())
+                .unwrap_or_default();
             let attrs = cap.name("attrs").map(|m| m.as_str()).unwrap_or_default();
             let raw_content = cap.name("content").map(|m| m.as_str()).unwrap_or_default();
 
-            let is_break_tag = tag == "hr" || attrs.contains("scene-break") || attrs.contains("scene_break");
+            let is_break_tag =
+                tag == "hr" || attrs.contains("scene-break") || attrs.contains("scene_break");
             if tag == "div" && !is_break_tag {
                 continue;
             }
 
-            let with_bold = bold_tag_re.replace_all(raw_content, "\u{E000}$1\u{E001}");
-            let with_bold = span_bold_re.replace_all(&with_bold, "\u{E000}$1\u{E001}");
-            let inner = tag_re.replace_all(&with_bold, "").trim().to_string();
+            let with_bold = rx.bold_tag_re.replace_all(raw_content, "\u{E000}$1\u{E001}");
+            let with_bold = rx.span_bold_re.replace_all(&with_bold, "\u{E000}$1\u{E001}");
+            let inner = rx.tag_strip_re.replace_all(&with_bold, "").trim().to_string();
             let inner = crate::text_utils::merge_bold_tokens(&inner);
 
             if is_break_tag || cleaner.is_scene_break(&inner) || cleaner.is_subsection(&inner) {
-                let sym = if inner.is_empty() { "* * *".to_string() } else { inner };
+                let sym = if inner.is_empty() {
+                    "* * *".to_string()
+                } else {
+                    inner
+                };
                 sec.paragraphs.push(Paragraph::scene_break_with_text(&sym));
-                sec.content_items.push(ContentItem::scene_break_with_text(&sym, idx + 1));
+                sec.content_items
+                    .push(ContentItem::scene_break_with_text(&sym, idx + 1));
                 continue;
             }
 
             if inner.is_empty() {
                 continue;
             }
-            let style = if attrs.contains("dialogue") {
+            let initial_style = if attrs.contains("dialogue") {
                 "dialogue"
             } else if attrs.contains("thought") {
                 "thought"
             } else {
                 "narrative"
             };
+            let standardized = cleaner.standardize_paragraph_text(&inner, initial_style);
+            let final_style = if attrs.contains("dialogue") || attrs.contains("thought") {
+                initial_style.to_string()
+            } else {
+                cleaner.classify_paragraph_style(&standardized, None)
+            };
             sec.paragraphs
-                .push(Paragraph::with_style(inner.clone(), style));
+                .push(Paragraph::with_style(standardized.clone(), &final_style));
             sec.content_items.push(ContentItem::text(
-                inner,
-                style.to_string(),
+                standardized,
+                final_style,
                 Vec::new(),
                 idx + 1,
             ));
@@ -442,34 +557,35 @@ fn parse_epub_bytes(epub_bytes: &[u8], filename: &str) -> Result<VolumeInfo, Str
         extracted_description = crate::epub_builder::detect_synopsis_from_sections(&sections);
     }
 
-    Ok(VolumeInfo {
-        pdf_path: filename.to_string(),
-        volume_number: vol_num,
-        title,
-        total_pages: sections.len(),
-        cover_image,
-        color_images,
-        sections,
-        all_verdicts,
-        spell_transformations: Vec::new(),
-        publisher: extracted_publisher,
-        description: extracted_description,
-    })
+    Ok((
+        VolumeInfo {
+            pdf_path: filename.to_string(),
+            volume_number: vol_num,
+            title,
+            total_pages: sections.len(),
+            cover_image,
+            color_images,
+            sections,
+            all_verdicts,
+            spell_transformations: Vec::new(),
+            publisher: extracted_publisher,
+            description: extracted_description,
+        },
+        resolved_lang.to_string(),
+    ))
 }
 
-pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, String> {
-    let mut builder = EpubBuilder::new();
-    let is_epub = filename.to_lowercase().ends_with(".epub");
-
-    let mut vol = if is_epub {
-        parse_epub_bytes(bytes, filename)?
-    } else {
-        builder.process_pdf_bytes(bytes, filename, true)?
-    };
-
+fn build_parsed_book_payload(
+    vol: VolumeInfo,
+    filename: &str,
+    builder: &EpubBuilder,
+    raw_pages: Vec<PdfPageData>,
+    scanned_page_numbers: Vec<usize>,
+) -> Result<String, String> {
     let detected_rules = compute_detected_rules(&vol);
 
-    let mut frontend_sections: Vec<FrontendChapterSection> = Vec::with_capacity(vol.sections.len() + 2);
+    let mut frontend_sections: Vec<FrontendChapterSection> =
+        Vec::with_capacity(vol.sections.len() + 2);
     let mut section_ids: Vec<String> = Vec::with_capacity(vol.sections.len());
     let mut section_order = 0usize;
 
@@ -513,7 +629,10 @@ pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, Stri
             ));
         }
         let start_p = non_cover_colors.first().map(|i| i.page_num).unwrap_or(1);
-        let end_p = non_cover_colors.last().map(|i| i.page_num).unwrap_or(start_p);
+        let end_p = non_cover_colors
+            .last()
+            .map(|i| i.page_num)
+            .unwrap_or(start_p);
         frontend_sections.push(FrontendChapterSection {
             id: sec_id,
             file_id: filename.to_string(),
@@ -568,7 +687,7 @@ pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, Stri
         illustrator: String::new(),
         series: inferred_series,
         volume: format!("Volumen {:02}", vol.volume_number),
-        language: LANGUAGE.to_string(),
+        language: builder.language.clone(),
         publisher: vol.publisher.clone().unwrap_or_default(),
         description: vol.description.clone().unwrap_or_default(),
         isbn: None,
@@ -585,35 +704,30 @@ pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, Stri
     };
 
     let spell_corrector = crate::spell_corrector::ContextualSpellCorrector::default();
-    let audit_opts = crate::spell_corrector::SpellAuditOptions::default();
-    let mut audit_stats = crate::spell_corrector::SpellAuditStats::default();
-    let mut all_spell_corrections = Vec::new();
-
-    for sec in &mut vol.sections {
-        let mut paras_clone = sec.paragraphs.clone();
-        let (f_corrections, _) = spell_corrector.audit_section_paragraphs(
-            filename,
-            &mut paras_clone,
-            vol.volume_number,
-            sec.start_page,
-            &sec.title,
-            &audit_opts,
-            &mut audit_stats,
-            false,
-            all_spell_corrections.len() + 1,
-        );
-        all_spell_corrections.extend(f_corrections);
+    let mut audit_opts = crate::spell_corrector::SpellAuditOptions::default();
+    if builder.language == "en" {
+        audit_opts.language_mode = "en".to_string();
     }
+    let (all_spell_corrections, audit_stats) = spell_corrector.audit_sections_parallel(
+        filename,
+        &vol.sections,
+        vol.volume_number,
+        &audit_opts,
+    );
 
-    LOADED_VOLUMES.with(|store| {
-        store.borrow_mut().insert(
+    let needs_ocr = !scanned_page_numbers.is_empty();
+
+    if let Ok(mut map) = loaded_volumes_store().write() {
+        map.insert(
             filename.to_string(),
-            StoredVolume {
+            Arc::new(StoredVolume {
                 volume: vol,
                 section_ids,
-            },
+                raw_pages,
+                scanned_page_numbers: scanned_page_numbers.clone(),
+            }),
         );
-    });
+    }
 
     let payload = WasmParsedBookPayload {
         metadata,
@@ -624,38 +738,64 @@ pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, Stri
         ignored_japanese_count: audit_stats.ignored_japanese_count,
         ignored_foreign_count: audit_stats.ignored_foreign_count,
         ignored_proper_nouns_count: audit_stats.ignored_proper_nouns_count,
+        needs_ocr,
+        scanned_page_numbers,
     };
 
     serde_json::to_string(&payload).map_err(|e| e.to_string())
+}
+
+pub fn parse_book_file_json(bytes: &[u8], filename: &str) -> Result<String, String> {
+    parse_book_file_with_options_json(bytes, filename, "{}")
+}
+
+pub fn parse_book_file_with_options_json(
+    bytes: &[u8],
+    filename: &str,
+    options_json: &str,
+) -> Result<String, String> {
+    let options: ParseOptions = serde_json::from_str(options_json).unwrap_or_default();
+    let mut builder = EpubBuilder::with_options(&options);
+    let lower_name = filename.to_lowercase();
+    let is_epub_or_bundle =
+        lower_name.ends_with(".epub") || lower_name.ends_with(".editnovel");
+
+    let (vol, raw_pages, scanned_pages) = if is_epub_or_bundle {
+        let (v, resolved_lang) = parse_epub_bytes_with_options(bytes, filename, &options)?;
+        builder.language = resolved_lang;
+        (v, Vec::new(), Vec::new())
+    } else {
+        let doc = ParsedPdfDocument::from_bytes(bytes)?;
+        let scanned = doc.detect_scanned_pages();
+        let pages_copy = doc.pages.clone();
+        builder.configure_for_pages(&doc.pages, &options);
+        let v = builder.process_parsed_pdf(&doc, filename, true);
+        (v, pages_copy, scanned)
+    };
+
+    build_parsed_book_payload(vol, filename, &builder, raw_pages, scanned_pages)
 }
 
 pub fn audit_spelling_json(file_id: &str, options_json: &str) -> Result<String, String> {
     let options: crate::spell_corrector::SpellAuditOptions =
         serde_json::from_str(options_json).unwrap_or_default();
     let spell_corrector = crate::spell_corrector::ContextualSpellCorrector::default();
-    let mut stats = crate::spell_corrector::SpellAuditStats::default();
-    let mut all_corrections = Vec::new();
 
-    LOADED_VOLUMES.with(|store| {
-        let map = store.borrow();
-        if let Some(stored) = map.get(file_id) {
-            for sec in &stored.volume.sections {
-                let mut paras_clone = sec.paragraphs.clone();
-                let (corrections, _) = spell_corrector.audit_section_paragraphs(
-                    file_id,
-                    &mut paras_clone,
-                    stored.volume.volume_number,
-                    sec.start_page,
-                    &sec.title,
-                    &options,
-                    &mut stats,
-                    false,
-                    all_corrections.len() + 1,
-                );
-                all_corrections.extend(corrections);
-            }
-        }
-    });
+    let stored_opt = loaded_volumes_store()
+        .read()
+        .ok()
+        .and_then(|map| map.get(file_id).cloned());
+
+    let (all_corrections, stats) = if let Some(stored) = stored_opt {
+        spell_corrector.audit_sections_parallel(
+            file_id,
+            &stored.volume.sections,
+            stored.volume.volume_number,
+            &options,
+        )
+    } else {
+        (Vec::new(), crate::spell_corrector::SpellAuditStats::default())
+    };
 
     let res = SpellAuditResult {
         corrections: all_corrections,
@@ -676,8 +816,8 @@ pub fn audit_dynamic_paragraphs_json(request_json: &str) -> Result<String, Strin
 }
 
 pub fn set_custom_cover(filename: &str, ext: &str, data: &[u8]) {
-    CUSTOM_COVER.with(|cell| {
-        *cell.borrow_mut() = Some(ExtractedImage {
+    if let Ok(mut guard) = custom_cover_store().write() {
+        *guard = Some(ExtractedImage {
             page_num: 1,
             image_index: 0,
             ext: ext.to_string(),
@@ -692,18 +832,18 @@ pub fn set_custom_cover(filename: &str, ext: &str, data: &[u8]) {
             is_kept: true,
             reason: "User custom cover".to_string(),
         });
-    });
+    }
 }
 
 pub fn clear_custom_cover() {
-    CUSTOM_COVER.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
+    if let Ok(mut guard) = custom_cover_store().write() {
+        *guard = None;
+    }
 }
 
 pub fn get_image_bytes(file_id: &str, image_name: &str) -> Option<Vec<u8>> {
-    let custom = CUSTOM_COVER.with(|cell| {
-        cell.borrow().as_ref().and_then(|img| {
+    let custom = custom_cover_store().read().ok().and_then(|guard| {
+        guard.as_ref().and_then(|img| {
             if img.filename == image_name {
                 Some(img.data.clone())
             } else {
@@ -715,31 +855,179 @@ pub fn get_image_bytes(file_id: &str, image_name: &str) -> Option<Vec<u8>> {
         return custom;
     }
 
-    LOADED_VOLUMES.with(|store| {
-        let map = store.borrow();
-        let stored = map.get(file_id)?;
-        stored
-            .volume
-            .all_verdicts
-            .iter()
-            .find(|img| img.filename == image_name)
-            .map(|img| img.data.clone())
-    })
+    let stored = loaded_volumes_store()
+        .read()
+        .ok()
+        .and_then(|map| map.get(file_id).cloned())?;
+    stored
+        .volume
+        .all_verdicts
+        .iter()
+        .find(|img| img.filename == image_name)
+        .map(|img| img.data.clone())
 }
 
 pub fn remove_book_file(file_id: &str) {
-    LOADED_VOLUMES.with(|store| {
-        store.borrow_mut().remove(file_id);
-    });
+    if let Ok(mut map) = loaded_volumes_store().write() {
+        map.remove(file_id);
+    }
 }
 
-pub fn apply_transforms_internal(
-    content: &str,
+struct TransformStaticRegexes {
+    dialogue_dash_line_re: Regex,
+    curly_quote_open_re: Regex,
+    curly_quote_close_re: Regex,
+    clean_breaks_re: Regex,
+    empty_image_div_re: Regex,
+}
+
+static TRANSFORM_STATIC_REGEXES: OnceLock<TransformStaticRegexes> = OnceLock::new();
+
+fn get_transform_static_regexes() -> &'static TransformStaticRegexes {
+    TRANSFORM_STATIC_REGEXES.get_or_init(|| TransformStaticRegexes {
+        dialogue_dash_line_re: Regex::new(r"(?m)^-\s+").unwrap(),
+        curly_quote_open_re: Regex::new(r#"(^|[\s(\[>—«])"(\w)"#).unwrap(),
+        curly_quote_close_re: Regex::new(r#"(\w|[.!?…,;:])""#).unwrap(),
+        clean_breaks_re: Regex::new(r"(<p>\s*</p>\s*){2,}").unwrap(),
+        empty_image_div_re: Regex::new(
+            r#"<div\b[^>]*class="[^"]*(?:inline-image|full-illustration-wrap)[^"]*"[^>]*>\s*</div>"#,
+        )
+        .unwrap(),
+    })
+}
+
+static REGEX_RULE_CACHE: OnceLock<RwLock<HashMap<String, Option<Regex>>>> = OnceLock::new();
+static GLOSSARY_AC_CACHE: OnceLock<RwLock<HashMap<u64, Arc<(AhoCorasick, Vec<String>)>>>> =
+    OnceLock::new();
+static BLOCK_TRANSFORM_CACHE: OnceLock<RwLock<HashMap<(String, String), String>>> =
+    OnceLock::new();
+
+fn get_cached_regex(pattern: &str, case_insensitive: bool, multi_line: bool) -> Option<Regex> {
+    let cache = REGEX_RULE_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = format!("{}\u{0}{}\u{0}{}", pattern, case_insensitive, multi_line);
+    if let Ok(guard) = cache.read() {
+        if let Some(found) = guard.get(&key) {
+            return found.clone();
+        }
+    }
+    let compiled = RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .multi_line(multi_line)
+        .build()
+        .ok();
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= 256 {
+            guard.clear();
+        }
+        guard.insert(key, compiled.clone());
+    }
+    compiled
+}
+
+fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+fn get_cached_glossary_ac(
+    glossary: &[FrontendGlossaryReplacement],
+) -> Option<Arc<(AhoCorasick, Vec<String>)>> {
+    let mut active_terms: Vec<(&str, &str)> = Vec::new();
+    let mut seen_finds: HashSet<&str> = HashSet::new();
+    let mut sig: u64 = 14695981039346656037;
+
+    for term in glossary {
+        if !term.enabled || term.find.is_empty() {
+            continue;
+        }
+        if seen_finds.insert(term.find.as_str()) {
+            sig = fnv1a_update(sig, term.find.as_bytes());
+            sig = fnv1a_update(sig, &[0]);
+            sig = fnv1a_update(sig, term.replace.as_bytes());
+            sig = fnv1a_update(sig, &[0xff]);
+            active_terms.push((term.find.as_str(), term.replace.as_str()));
+        }
+    }
+
+    if active_terms.is_empty() {
+        return None;
+    }
+
+    let cache = GLOSSARY_AC_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(guard) = cache.read() {
+        if let Some(found) = guard.get(&sig) {
+            return Some(found.clone());
+        }
+    }
+
+    let patterns: Vec<&str> = active_terms.iter().map(|(f, _)| *f).collect();
+    let replacements: Vec<String> = active_terms.iter().map(|(_, r)| (*r).to_string()).collect();
+
+    let ac = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&patterns)
+        .ok()?;
+    let entry = Arc::new((ac, replacements));
+
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert(sig, entry.clone());
+    }
+    Some(entry)
+}
+
+pub fn compute_rules_signature(
     editorial_rules: &[FrontendEditorialRule],
     regex_rules: &[FrontendRegexRule],
     glossary: &[FrontendGlossaryReplacement],
 ) -> String {
-    let mut result = content.to_string();
+    let mut h: u64 = 14695981039346656037;
+    for rule in editorial_rules {
+        if rule.enabled {
+            h = fnv1a_update(h, b"E:");
+            h = fnv1a_update(h, rule.id.as_bytes());
+            h = fnv1a_update(h, &[0]);
+        }
+    }
+    for reg in regex_rules {
+        if reg.enabled && !reg.pattern.is_empty() {
+            h = fnv1a_update(h, b"R:");
+            h = fnv1a_update(h, reg.pattern.as_bytes());
+            h = fnv1a_update(h, &[0]);
+            h = fnv1a_update(h, reg.replacement.as_bytes());
+            h = fnv1a_update(h, &[0]);
+            h = fnv1a_update(h, reg.flags.as_bytes());
+            h = fnv1a_update(h, &[0]);
+        }
+    }
+    for term in glossary {
+        if term.enabled && !term.find.is_empty() {
+            h = fnv1a_update(h, b"G:");
+            h = fnv1a_update(h, term.find.as_bytes());
+            h = fnv1a_update(h, &[0]);
+            h = fnv1a_update(h, term.replace.as_bytes());
+            h = fnv1a_update(h, &[0]);
+        }
+    }
+    format!("{:016x}", h)
+}
+
+fn apply_text_node_transforms(
+    text_str: &str,
+    editorial_rules: &[FrontendEditorialRule],
+    compiled_regexes: &[(Regex, &str, bool)],
+    glossary_ac: Option<&(AhoCorasick, Vec<String>)>,
+) -> String {
+    if text_str.is_empty() {
+        return String::new();
+    }
+    let static_rx = get_transform_static_regexes();
+    let mut result = text_str.to_string();
 
     for rule in editorial_rules {
         if !rule.enabled {
@@ -748,54 +1036,144 @@ pub fn apply_transforms_internal(
         match rule.id.as_str() {
             "rule-dialogue-dashes" => {
                 result = result.replace("--", "—");
-                if let Ok(re) = Regex::new(r"(?m)^-\s+") {
-                    result = re.replace_all(&result, "—").to_string();
-                }
+                result = static_rx
+                    .dialogue_dash_line_re
+                    .replace_all(&result, "—")
+                    .to_string();
             }
             "rule-curly-quotes" => {
-                if let Ok(re) = Regex::new(r#"([\s(\[>])"(\w)"#) {
-                    result = re.replace_all(&result, "$1“$2").to_string();
-                }
+                result = static_rx
+                    .curly_quote_open_re
+                    .replace_all(&result, "$1“$2")
+                    .to_string();
+                result = static_rx
+                    .curly_quote_close_re
+                    .replace_all(&result, "$1”")
+                    .to_string();
             }
             "rule-ellipsis" => {
                 result = result.replace("...", "…");
-            }
-            "rule-clean-breaks" => {
-                if let Ok(re) = Regex::new(r"(<p>\s*</p>\s*){2,}") {
-                    result = re.replace_all(&result, "").to_string();
-                }
             }
             _ => {}
         }
     }
 
+    for (rx, replacement, is_global) in compiled_regexes {
+        if *is_global {
+            result = rx.replace_all(&result, *replacement).to_string();
+        } else {
+            result = rx.replace(&result, *replacement).to_string();
+        }
+    }
+
+    if let Some((ac, replacements)) = glossary_ac {
+        result = ac.replace_all(&result, replacements);
+    }
+
+    result
+}
+
+pub fn filter_discarded_images_html(html: &str, discarded_names: &HashSet<String>) -> String {
+    if discarded_names.is_empty() || !html.contains("<img") {
+        return html.to_string();
+    }
+    let discarded_vec: Vec<String> = discarded_names.iter().cloned().collect();
+    let settings =
+        RewriteStrSettings::new().append_element_content_handler(element!("img", move |el| {
+            if let Some(src) = el.get_attribute("src") {
+                let is_disc = discarded_vec.iter().any(|d| {
+                    src == *d || src.ends_with(&format!("/{}", d)) || src.contains(d.as_str())
+                });
+                if is_disc {
+                    el.remove();
+                }
+            }
+            Ok(())
+        }));
+    let rewritten = rewrite_str(html, settings).unwrap_or_else(|_| html.to_string());
+
+    get_transform_static_regexes()
+        .empty_image_div_re
+        .replace_all(&rewritten, "")
+        .to_string()
+}
+
+pub fn apply_transforms_internal(
+    content: &str,
+    editorial_rules: &[FrontendEditorialRule],
+    regex_rules: &[FrontendRegexRule],
+    glossary: &[FrontendGlossaryReplacement],
+) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    let static_rx = get_transform_static_regexes();
+    let mut working = content.to_string();
+
+    let clean_breaks_enabled = editorial_rules
+        .iter()
+        .any(|r| r.enabled && r.id == "rule-clean-breaks");
+    if clean_breaks_enabled && working.contains("<p>") {
+        working = static_rx.clean_breaks_re.replace_all(&working, "").to_string();
+    }
+
+    let mut compiled_regexes: Vec<(Regex, &str, bool)> = Vec::new();
     for reg in regex_rules {
         if !reg.enabled || reg.pattern.is_empty() {
             continue;
         }
         let case_insensitive = reg.flags.contains('i');
         let multi_line = reg.flags.contains('m');
-        if let Ok(rx) = RegexBuilder::new(&reg.pattern)
-            .case_insensitive(case_insensitive)
-            .multi_line(multi_line)
-            .build()
-        {
-            if reg.flags.contains('g') || reg.flags.is_empty() {
-                result = rx.replace_all(&result, reg.replacement.as_str()).to_string();
-            } else {
-                result = rx.replace(&result, reg.replacement.as_str()).to_string();
+        let is_global = reg.flags.contains('g') || reg.flags.is_empty();
+        if let Some(rx) = get_cached_regex(&reg.pattern, case_insensitive, multi_line) {
+            compiled_regexes.push((rx, reg.replacement.as_str(), is_global));
+        }
+    }
+
+    let glossary_ac = get_cached_glossary_ac(glossary);
+    let glossary_ref = glossary_ac.as_deref();
+
+    if !working.contains('<') || !working.contains('>') {
+        return apply_text_node_transforms(
+            &working,
+            editorial_rules,
+            &compiled_regexes,
+            glossary_ref,
+        );
+    }
+
+    let wrapped = format!("<editnovel-root>{}</editnovel-root>", working);
+    let text_buffer = RefCell::new(String::new());
+    let settings = RewriteStrSettings::new().append_element_content_handler(text!(
+        "*:not(script):not(style)",
+        |t| {
+            if !t.as_str().is_empty() {
+                text_buffer.borrow_mut().push_str(t.as_str());
+                t.remove();
             }
+            if t.last_in_text_node() {
+                let full_text = std::mem::take(&mut *text_buffer.borrow_mut());
+                if !full_text.is_empty() {
+                    let transformed = apply_text_node_transforms(
+                        &full_text,
+                        editorial_rules,
+                        &compiled_regexes,
+                        glossary_ref,
+                    );
+                    t.after(&transformed, ContentType::Html);
+                }
+            }
+            Ok(())
         }
-    }
+    ));
+    let rewritten = rewrite_str(&wrapped, settings).unwrap_or(wrapped);
 
-    for term in glossary {
-        if !term.enabled || term.find.is_empty() {
-            continue;
-        }
-        result = result.replace(&term.find, &term.replace);
-    }
-
-    result
+    rewritten
+        .strip_prefix("<editnovel-root>")
+        .unwrap_or(&rewritten)
+        .strip_suffix("</editnovel-root>")
+        .unwrap_or(&rewritten)
+        .to_string()
 }
 
 pub fn apply_editorial_transforms_json(
@@ -819,6 +1197,9 @@ pub fn build_epub_from_json(payload_json: &str) -> Result<Vec<u8>, String> {
         serde_json::from_str(payload_json).map_err(|e| e.to_string())?;
 
     let mut builder = EpubBuilder::new();
+    if !req.metadata.language.trim().is_empty() {
+        builder.language = req.metadata.language.trim().to_string();
+    }
     if !req.metadata.publisher.trim().is_empty() {
         builder.custom_publisher = Some(req.metadata.publisher.trim().to_string());
     }
@@ -856,161 +1237,165 @@ pub fn build_epub_from_json(payload_json: &str) -> Result<Vec<u8>, String> {
     }
     let mut active_volumes: Vec<VolumeInfo> = Vec::new();
 
-    LOADED_VOLUMES.with(|store| {
-        let map = store.borrow();
-        for (g_idx, group) in req.groups.iter().enumerate() {
-            let stored_opt = map.get(&group.file_id);
-            let mut vol = if let Some(stored) = stored_opt {
-                stored.volume.clone()
-            } else {
-                VolumeInfo {
-                    pdf_path: String::new(),
-                    volume_number: g_idx + 1,
-                    title: if !group.file_name.trim().is_empty() {
-                        group.file_name.clone()
-                    } else {
-                        format!("Parte {}", g_idx + 1)
-                    },
-                    total_pages: 0,
-                    cover_image: None,
-                    color_images: Vec::new(),
-                    sections: Vec::new(),
-                    all_verdicts: Vec::new(),
-                    spell_transformations: Vec::new(),
-                    publisher: None,
-                    description: None,
-                }
-            };
-            if !req.metadata.title.trim().is_empty() && req.groups.len() == 1 {
-                vol.title = req.metadata.title.trim().to_string();
+    let custom_cov_global = custom_cover_store()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+
+    let loaded_snapshot: HashMap<String, Arc<StoredVolume>> = loaded_volumes_store()
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+
+    for (g_idx, group) in req.groups.iter().enumerate() {
+        let stored_opt = loaded_snapshot.get(&group.file_id);
+        let mut vol = if let Some(stored) = stored_opt {
+            stored.volume.clone()
+        } else {
+            VolumeInfo {
+                pdf_path: String::new(),
+                volume_number: g_idx + 1,
+                title: if !group.file_name.trim().is_empty() {
+                    group.file_name.clone()
+                } else {
+                    format!("Parte {}", g_idx + 1)
+                },
+                total_pages: 0,
+                cover_image: None,
+                color_images: Vec::new(),
+                sections: Vec::new(),
+                all_verdicts: Vec::new(),
+                spell_transformations: Vec::new(),
+                publisher: None,
+                description: None,
             }
+        };
+        if !req.metadata.title.trim().is_empty() && req.groups.len() == 1 {
+            vol.title = req.metadata.title.trim().to_string();
+        }
 
-            let discarded_names: HashSet<String> = req
-                .images
-                .iter()
-                .filter(|img| img.file_id == group.file_id && img.is_discarded)
-                .map(|img| img.name.clone())
-                .collect();
+        let discarded_names: HashSet<String> = req
+            .images
+            .iter()
+            .filter(|img| img.file_id == group.file_id && img.is_discarded)
+            .map(|img| img.name.clone())
+            .collect();
 
-            let is_cover_removed = req.remove_cover.unwrap_or(false);
-            if is_cover_removed {
+        let is_cover_removed = req.remove_cover.unwrap_or(false);
+        if is_cover_removed {
+            vol.cover_image = None;
+        } else if let Some(cov) = custom_cov_global.clone() {
+            vol.cover_image = Some(cov.clone());
+            vol.all_verdicts.retain(|img| !img.is_cover);
+            vol.all_verdicts.push(cov);
+        } else if let Some(ref cov) = vol.cover_image {
+            let cover_section_exists = group.sections.iter().any(|s| s.id.ends_with("-cover"));
+            if discarded_names.contains(&cov.filename) || !cover_section_exists {
                 vol.cover_image = None;
-            } else {
-                let custom_cov = CUSTOM_COVER.with(|cell| cell.borrow().clone());
-                if let Some(cov) = custom_cov {
-                    vol.cover_image = Some(cov.clone());
-                    vol.all_verdicts.retain(|img| !img.is_cover);
-                    vol.all_verdicts.push(cov);
-                } else if let Some(ref cov) = vol.cover_image {
-                    let cover_section_exists = group.sections.iter().any(|s| s.id.ends_with("-cover"));
-                    if discarded_names.contains(&cov.filename) || !cover_section_exists {
-                        vol.cover_image = None;
-                    }
-                }
             }
-            let color_section_exists = group.sections.iter().any(|s| s.id.ends_with("-color-inserts"));
-            if !color_section_exists {
-                vol.color_images.clear();
-            } else {
-                vol.color_images
-                    .retain(|img| !discarded_names.contains(&img.filename));
-            }
+        }
+        let color_section_exists = group
+            .sections
+            .iter()
+            .any(|s| s.id.ends_with("-color-inserts"));
+        if !color_section_exists {
+            vol.color_images.clear();
+        } else {
+            vol.color_images
+                .retain(|img| !discarded_names.contains(&img.filename));
+        }
 
-            let mut reordered_sections: Vec<Section> = Vec::with_capacity(group.sections.len());
-            for f_sec in &group.sections {
-                let mut sec = if let Some(stored) = stored_opt {
-                    if let Some(orig_idx) = stored.section_ids.iter().position(|id| id == &f_sec.id) {
-                        stored.volume.sections.get(orig_idx).cloned().unwrap_or_else(|| {
-                            Section::new(f_sec.title.clone(), None, 1, 1)
-                        })
-                    } else {
-                        Section::new(f_sec.title.clone(), None, 1, 1)
-                    }
+        let mut reordered_sections: Vec<Section> = Vec::with_capacity(group.sections.len());
+        for f_sec in &group.sections {
+            let mut sec = if let Some(stored) = stored_opt {
+                if let Some(orig_idx) = stored.section_ids.iter().position(|id| id == &f_sec.id) {
+                    stored
+                        .volume
+                        .sections
+                        .get(orig_idx)
+                        .cloned()
+                        .unwrap_or_else(|| Section::new(f_sec.title.clone(), None, 1, 1))
                 } else {
                     Section::new(f_sec.title.clone(), None, 1, 1)
-                };
-
-                sec.title = f_sec.title.clone();
-                sec.section_type = Some(f_sec.section_type.clone());
-                if !f_sec.html_content.trim().is_empty() {
-                    let mut custom = f_sec.html_content.clone();
-                    for discarded in &discarded_names {
-                        let pat = format!(r#"(?s)<div[^>]*class="[^"]*inline-image[^"]*"[^>]*>.*?<img[^>]*{}[^>]*>.*?</div>"#, regex::escape(discarded));
-                        if let Ok(re) = Regex::new(&pat) {
-                            custom = re.replace_all(&custom, "").to_string();
-                        }
-                        let pat_img = format!(r#"<img[^>]*{}[^>]*>"#, regex::escape(discarded));
-                        if let Ok(re) = Regex::new(&pat_img) {
-                            custom = re.replace_all(&custom, "").to_string();
-                        }
-                    }
-                    sec.custom_html = Some(custom);
                 }
-                sec.content_items.retain(|item| match item.payload {
-                    ContentItemPayload::Image(ref img) => {
-                        !discarded_names.contains(&img.filename)
-                    }
-                    _ => true,
-                });
-                let is_volume_spell_enabled = req
-                    .global_spell_enabled
-                    .unwrap_or(true)
-                    && req
-                        .volume_spell_settings
-                        .as_ref()
-                        .and_then(|m| m.get(&group.file_id))
-                        .copied()
-                        .unwrap_or(true);
+            } else {
+                Section::new(f_sec.title.clone(), None, 1, 1)
+            };
 
-                let active_corrections: Vec<&crate::models::FrontendSpellCorrection> = req
-                    .spell_corrections
+            sec.title = f_sec.title.clone();
+            sec.section_type = Some(f_sec.section_type.clone());
+            if !f_sec.html_content.trim().is_empty() {
+                let custom = filter_discarded_images_html(&f_sec.html_content, &discarded_names);
+                sec.custom_html = Some(custom);
+            }
+            sec.content_items.retain(|item| match item.payload {
+                ContentItemPayload::Image(ref img) => !discarded_names.contains(&img.filename),
+                _ => true,
+            });
+            let is_volume_spell_enabled = req.global_spell_enabled.unwrap_or(true)
+                && req
+                    .volume_spell_settings
                     .as_ref()
-                    .map(|list| {
-                        list.iter()
-                            .filter(|c| c.file_id == group.file_id && c.section_title == sec.title && c.enabled)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    .and_then(|m| m.get(&group.file_id))
+                    .copied()
+                    .unwrap_or(true);
 
-                if let Some(ref mut custom) = sec.custom_html {
-                    if is_volume_spell_enabled {
-                        for corr in &active_corrections {
-                            if custom.contains(&corr.original_token) {
-                                *custom = custom.replace(&corr.original_token, &corr.replacement_token);
-                            }
-                        }
-                    }
-                    *custom = apply_transforms_internal(
-                        custom,
+            let active_corrections: Vec<&crate::models::FrontendSpellCorrection> = req
+                .spell_corrections
+                .as_ref()
+                .map(|list| {
+                    list.iter()
+                        .filter(|c| {
+                            c.file_id == group.file_id
+                                && c.section_title == sec.title
+                                && c.enabled
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let spell_glossary: Vec<FrontendGlossaryReplacement> = if is_volume_spell_enabled {
+                active_corrections
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, corr)| FrontendGlossaryReplacement {
+                        id: format!("sp-{}", idx),
+                        find: corr.original_token.clone(),
+                        replace: corr.replacement_token.clone(),
+                        enabled: true,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut combined_glossary = spell_glossary;
+            combined_glossary.extend(req.glossary.iter().cloned());
+
+            if let Some(ref mut custom) = sec.custom_html {
+                *custom = apply_transforms_internal(
+                    custom,
+                    &req.editorial_rules,
+                    &req.regex_rules,
+                    &combined_glossary,
+                );
+            }
+
+            for item in &mut sec.content_items {
+                if let ContentItemPayload::Paragraph(ref mut p) = item.payload {
+                    p.text = apply_transforms_internal(
+                        &p.text,
                         &req.editorial_rules,
                         &req.regex_rules,
-                        &req.glossary,
+                        &combined_glossary,
                     );
                 }
-
-                for item in &mut sec.content_items {
-                    if let ContentItemPayload::Paragraph(ref mut p) = item.payload {
-                        if is_volume_spell_enabled {
-                            for corr in &active_corrections {
-                                if p.text.contains(&corr.original_token) {
-                                    p.text = p.text.replace(&corr.original_token, &corr.replacement_token);
-                                }
-                            }
-                        }
-                        p.text = apply_transforms_internal(
-                            &p.text,
-                            &req.editorial_rules,
-                            &req.regex_rules,
-                            &req.glossary,
-                        );
-                    }
-                }
-                reordered_sections.push(sec);
             }
-            vol.sections = reordered_sections;
-            active_volumes.push(vol);
+            reordered_sections.push(sec);
         }
-    });
+        vol.sections = reordered_sections;
+        active_volumes.push(vol);
+    }
 
     if active_volumes.is_empty() {
         return Err("No loaded volumes available for export".to_string());
@@ -1023,16 +1408,8 @@ pub fn build_epub_from_json(payload_json: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn parse_book_file_with_options_json(
-    bytes: &[u8],
-    filename: &str,
-    _options_json: &str,
-) -> Result<String, String> {
-    parse_book_file_json(bytes, filename)
-}
-
-pub fn init_dictionary(_lang: &str, _bytes: &[u8]) -> Result<(), String> {
-    Ok(())
+pub fn init_dictionary(lang: &str, bytes: &[u8]) -> Result<(), String> {
+    crate::spell_corrector::init_dictionary(lang, bytes)
 }
 
 #[derive(Deserialize)]
@@ -1046,7 +1423,7 @@ pub struct TransformSectionRequest {
     pub glossary: Vec<FrontendGlossaryReplacement>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransformSectionResult {
     pub request_id: u64,
@@ -1058,27 +1435,178 @@ pub struct TransformSectionResult {
 pub fn transform_section_blocks_json(request_json: &str) -> Result<String, String> {
     let req: TransformSectionRequest =
         serde_json::from_str(request_json).map_err(|e| e.to_string())?;
-    let transformed = apply_transforms_internal(
-        &req.html,
+    let rules_signature = compute_rules_signature(
         &req.editorial_rules,
         &req.regex_rules,
         &req.glossary,
     );
+
+    let static_rx = get_transform_static_regexes();
+    let clean_breaks_enabled = req
+        .editorial_rules
+        .iter()
+        .any(|r| r.enabled && r.id == "rule-clean-breaks");
+    let source_html = if clean_breaks_enabled && req.html.contains("<p>") {
+        static_rx.clean_breaks_re.replace_all(&req.html, "").to_string()
+    } else {
+        req.html.clone()
+    };
+
+    let block_cache = BLOCK_TRANSFORM_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let lines: Vec<&str> = source_html.split('\n').collect();
+    let mut transformed_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        if line.trim().is_empty() {
+            transformed_lines.push(line.to_string());
+            continue;
+        }
+        let cache_key = (rules_signature.clone(), line.to_string());
+        let cached_opt = block_cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&cache_key).cloned());
+        if let Some(hit) = cached_opt {
+            transformed_lines.push(hit);
+        } else {
+            let out_line = apply_transforms_internal(
+                line,
+                &req.editorial_rules,
+                &req.regex_rules,
+                &req.glossary,
+            );
+            if let Ok(mut guard) = block_cache.write() {
+                if guard.len() >= 4096 {
+                    guard.clear();
+                }
+                guard.insert(cache_key, out_line.clone());
+            }
+            transformed_lines.push(out_line);
+        }
+    }
+
     let res = TransformSectionResult {
         request_id: req.request_id,
         section_id: req.section_id,
-        html: transformed,
-        rules_signature: String::new(),
+        html: transformed_lines.join("\n"),
+        rules_signature,
     };
     serde_json::to_string(&res).map_err(|e| e.to_string())
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OcrPagesPayload {
+    List(Vec<OcrPageInput>),
+    Wrapped { pages: Vec<OcrPageInput> },
+}
+
 pub fn inject_ocr_pages_json(
-    _file_id: &str,
-    _pages_json: &str,
-    _options_json: &str,
+    file_id: &str,
+    pages_json: &str,
+    options_json: &str,
 ) -> Result<String, String> {
-    Err("OCR injection not yet implemented".to_string())
+    let parsed_payload: OcrPagesPayload =
+        serde_json::from_str(pages_json).map_err(|e| format!("Invalid OCR pages JSON: {}", e))?;
+    let ocr_pages = match parsed_payload {
+        OcrPagesPayload::List(list) => list,
+        OcrPagesPayload::Wrapped { pages } => pages,
+    };
+    if ocr_pages.is_empty() {
+        return Err("No OCR pages provided".to_string());
+    }
+
+    let options: ParseOptions = serde_json::from_str(options_json).unwrap_or_default();
+
+    let existing_stored = loaded_volumes_store()
+        .read()
+        .ok()
+        .and_then(|map| map.get(file_id).cloned());
+
+    let (mut pages, existing_imgs, existing_pub, existing_desc) =
+        if let Some(ref stored) = existing_stored {
+            let mut p_vec = stored.raw_pages.clone();
+            let max_pno = ocr_pages
+                .iter()
+                .enumerate()
+                .map(|(i, p)| if p.page_number > 0 { p.page_number } else { i + 1 })
+                .max()
+                .unwrap_or(1);
+            if p_vec.len() < max_pno {
+                p_vec.resize(
+                    max_pno,
+                    PdfPageData {
+                        width: 595.0,
+                        height: 842.0,
+                        blocks: Vec::new(),
+                        image_refs: Vec::new(),
+                    },
+                );
+            }
+            let mut page_images_map: HashMap<usize, Vec<ExtractedImage>> = HashMap::new();
+            for img in &stored.volume.all_verdicts {
+                if img.is_kept && !img.is_cover && img.category != "color_inserts" {
+                    page_images_map
+                        .entry(img.page_num)
+                        .or_default()
+                        .push(img.clone());
+                }
+            }
+            let imgs = Some((
+                stored.volume.cover_image.clone(),
+                stored.volume.color_images.clone(),
+                page_images_map,
+                stored.volume.all_verdicts.clone(),
+            ));
+            (
+                p_vec,
+                imgs,
+                stored.volume.publisher.clone(),
+                stored.volume.description.clone(),
+            )
+        } else {
+            let max_pno = ocr_pages
+                .iter()
+                .enumerate()
+                .map(|(i, p)| if p.page_number > 0 { p.page_number } else { i + 1 })
+                .max()
+                .unwrap_or(1);
+            let p_vec = vec![
+                PdfPageData {
+                    width: 595.0,
+                    height: 842.0,
+                    blocks: Vec::new(),
+                    image_refs: Vec::new(),
+                };
+                max_pno
+            ];
+            (p_vec, None, None, None)
+        };
+
+    let mut injected_page_nums: HashSet<usize> = HashSet::new();
+    for (idx, ocr_page) in ocr_pages.iter().enumerate() {
+        let pno = if ocr_page.page_number > 0 {
+            ocr_page.page_number
+        } else {
+            idx + 1
+        };
+        let converted = ocr_page_to_pdf_page_data(ocr_page);
+        if pno >= 1 && pno <= pages.len() {
+            pages[pno - 1].width = converted.width;
+            pages[pno - 1].height = converted.height;
+            pages[pno - 1].blocks = converted.blocks;
+            injected_page_nums.insert(pno);
+        }
+    }
+
+    let mut builder = EpubBuilder::with_options(&options);
+    builder.configure_for_pages(&pages, &options);
+    let vol = builder.process_pdf_pages(&pages, file_id, existing_imgs, existing_pub, existing_desc);
+
+    let mut remaining_scanned = detect_scanned_pages_from_pages(&pages, None);
+    remaining_scanned.retain(|pno| !injected_page_nums.contains(pno));
+
+    build_parsed_book_payload(vol, file_id, &builder, pages, remaining_scanned)
 }
 
 pub fn compress_brotli(bytes: &[u8]) -> Result<Vec<u8>, String> {
