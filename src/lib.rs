@@ -1022,3 +1022,78 @@ pub fn build_epub_from_json(payload_json: &str) -> Result<Vec<u8>, String> {
         builder.build_omnibus_bytes(&active_volumes)
     }
 }
+
+pub fn parse_book_file_with_options_json(
+    bytes: &[u8],
+    filename: &str,
+    _options_json: &str,
+) -> Result<String, String> {
+    parse_book_file_json(bytes, filename)
+}
+
+pub fn init_dictionary(_lang: &str, _bytes: &[u8]) -> Result<(), String> {
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformSectionRequest {
+    pub request_id: u64,
+    pub section_id: String,
+    pub html: String,
+    pub editorial_rules: Vec<FrontendEditorialRule>,
+    pub regex_rules: Vec<FrontendRegexRule>,
+    pub glossary: Vec<FrontendGlossaryReplacement>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformSectionResult {
+    pub request_id: u64,
+    pub section_id: String,
+    pub html: String,
+    pub rules_signature: String,
+}
+
+pub fn transform_section_blocks_json(request_json: &str) -> Result<String, String> {
+    let req: TransformSectionRequest =
+        serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+    let transformed = apply_transforms_internal(
+        &req.html,
+        &req.editorial_rules,
+        &req.regex_rules,
+        &req.glossary,
+    );
+    let res = TransformSectionResult {
+        request_id: req.request_id,
+        section_id: req.section_id,
+        html: transformed,
+        rules_signature: String::new(),
+    };
+    serde_json::to_string(&res).map_err(|e| e.to_string())
+}
+
+pub fn inject_ocr_pages_json(
+    _file_id: &str,
+    _pages_json: &str,
+    _options_json: &str,
+) -> Result<String, String> {
+    Err("OCR injection not yet implemented".to_string())
+}
+
+pub fn compress_brotli(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut out = Vec::new();
+    let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 6, 22);
+    writer.write_all(bytes).map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(out)
+}
+
+pub fn decompress_brotli(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut reader = brotli::Decompressor::new(bytes, 4096);
+    reader.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
