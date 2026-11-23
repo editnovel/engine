@@ -36,10 +36,13 @@ jobs:
             dist/engine-contracts.ts
             dist/dicts_br.tar.gz
       - name: Notify editnovel/portal
-        if: env.PORTAL_DISPATCH_TOKEN != ''
         env:
           PORTAL_DISPATCH_TOKEN: ${{ secrets.PORTAL_DISPATCH_TOKEN }}
         run: |
+          if [ -z "${PORTAL_DISPATCH_TOKEN}" ]; then
+            echo "PORTAL_DISPATCH_TOKEN secret not configured; skipping portal dispatch."
+            exit 0
+          fi
           MANIFEST_B64=$(base64 -w0 dist/engine-manifest.json)
           TS_B64=$(base64 -w0 dist/engine-contracts.ts)
           PAYLOAD=$(jq -n --arg m "$MANIFEST_B64" --arg t "$TS_B64" '{event_type: "engine-updated", client_payload: {manifest_b64: $m, contracts_ts_b64: $t}}')
