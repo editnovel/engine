@@ -1,5 +1,7 @@
 use crate::models::{ExtractedImage, PdfExtractedXrefImage, PdfPageData};
 use crate::pdf_extractor::{compute_dhash_from_bytes, ParsedPdfDocument};
+#[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -115,24 +117,49 @@ impl HybridImageClassifier {
         let mut seen_dhashes: HashMap<String, usize> = HashMap::new();
         let mut dhash_xrefs: HashSet<u32> = HashSet::new();
         let mut extracted_cache: HashMap<u32, (PdfExtractedXrefImage, String)> = HashMap::new();
+        let mut unique_xrefs: Vec<u32> = Vec::new();
 
         for page in &doc.pages {
             for img_ref in &page.image_refs {
-                if !dhash_xrefs.insert(img_ref.xref) {
-                    continue;
-                }
-                if let Some(extracted) = doc.extract_image_by_xref(img_ref.xref) {
-                    let dh = if extracted.width >= 250 && extracted.height >= 250 {
-                        compute_dhash_from_bytes(&extracted.data).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    if !dh.is_empty() {
-                        *seen_dhashes.entry(dh.clone()).or_insert(0) += 1;
-                    }
-                    extracted_cache.insert(img_ref.xref, (extracted, dh));
+                if dhash_xrefs.insert(img_ref.xref) {
+                    unique_xrefs.push(img_ref.xref);
                 }
             }
+        }
+
+        #[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+        let extracted_list: Vec<(u32, PdfExtractedXrefImage, String)> = unique_xrefs
+            .par_iter()
+            .filter_map(|&xref| {
+                let extracted = doc.extract_image_by_xref(xref)?;
+                let dh = if extracted.width >= 250 && extracted.height >= 250 {
+                    compute_dhash_from_bytes(&extracted.data).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Some((xref, extracted, dh))
+            })
+            .collect();
+
+        #[cfg(all(not(feature = "parallel"), target_arch = "wasm32"))]
+        let extracted_list: Vec<(u32, PdfExtractedXrefImage, String)> = unique_xrefs
+            .iter()
+            .filter_map(|&xref| {
+                let extracted = doc.extract_image_by_xref(xref)?;
+                let dh = if extracted.width >= 250 && extracted.height >= 250 {
+                    compute_dhash_from_bytes(&extracted.data).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Some((xref, extracted, dh))
+            })
+            .collect();
+
+        for (xref, extracted, dh) in extracted_list {
+            if !dh.is_empty() {
+                *seen_dhashes.entry(dh.clone()).or_insert(0) += 1;
+            }
+            extracted_cache.insert(xref, (extracted, dh));
         }
 
         for (pno, page) in doc.pages.iter().enumerate() {

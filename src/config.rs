@@ -1,5 +1,6 @@
 use crate::models::PdfPageData;
 use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -9,6 +10,201 @@ pub const ENABLE_DROP_CAPS: bool = true;
 pub const FOOTNOTE_STYLE: &str = "end_of_chapter";
 pub const FULL_PAGE_ILLUSTRATIONS: bool = true;
 pub const SKIP_VISUAL_TOC_PAGES: bool = true;
+
+fn default_parse_language() -> String {
+    "auto".to_string()
+}
+
+fn default_preset_id() -> String {
+    "visual-novel".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseOptions {
+    #[serde(default = "default_parse_language", alias = "lang")]
+    pub language: String,
+    #[serde(
+        default = "default_preset_id",
+        alias = "preset_id",
+        alias = "preset",
+        alias = "profile"
+    )]
+    pub preset_id: String,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        Self {
+            language: default_parse_language(),
+            preset_id: default_preset_id(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetProfile {
+    pub id: String,
+    pub enable_drop_caps: bool,
+    pub enable_lit_rpg_brackets: bool,
+    pub enable_scene_breaks: bool,
+    pub footnote_style: String,
+    pub full_page_illustrations: bool,
+}
+
+impl Default for PresetProfile {
+    fn default() -> Self {
+        Self::from_id("visual-novel")
+    }
+}
+
+impl PresetProfile {
+    pub fn from_id(raw_id: &str) -> Self {
+        let norm = raw_id.trim().to_lowercase();
+        match norm.as_str() {
+            "webnovel" | "en-litrpg" | "litrpg" => Self {
+                id: "webnovel".to_string(),
+                enable_drop_caps: false,
+                enable_lit_rpg_brackets: true,
+                enable_scene_breaks: true,
+                footnote_style: "callout_card".to_string(),
+                full_page_illustrations: true,
+            },
+            "generic" | "en-fiction" | "fiction" => Self {
+                id: "generic".to_string(),
+                enable_drop_caps: true,
+                enable_lit_rpg_brackets: false,
+                enable_scene_breaks: true,
+                footnote_style: "end_of_chapter".to_string(),
+                full_page_illustrations: false,
+            },
+            "readme" => Self {
+                id: "readme".to_string(),
+                enable_drop_caps: false,
+                enable_lit_rpg_brackets: false,
+                enable_scene_breaks: true,
+                footnote_style: "end_of_chapter".to_string(),
+                full_page_illustrations: false,
+            },
+            "paper" => Self {
+                id: "paper".to_string(),
+                enable_drop_caps: false,
+                enable_lit_rpg_brackets: false,
+                enable_scene_breaks: false,
+                footnote_style: "end_of_chapter".to_string(),
+                full_page_illustrations: false,
+            },
+            _ => Self {
+                id: "visual-novel".to_string(),
+                enable_drop_caps: ENABLE_DROP_CAPS,
+                enable_lit_rpg_brackets: true,
+                enable_scene_breaks: true,
+                footnote_style: FOOTNOTE_STYLE.to_string(),
+                full_page_illustrations: FULL_PAGE_ILLUSTRATIONS,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageProfile {
+    pub code: String,
+    pub dialogue_open: String,
+    pub dialogue_close: String,
+    pub thought_open: String,
+    pub thought_close: String,
+    pub technique_open: String,
+    pub technique_close: String,
+    pub system_open: String,
+    pub system_close: String,
+    pub use_em_dash_dialogue: bool,
+}
+
+impl Default for LanguageProfile {
+    fn default() -> Self {
+        Self::for_language(LANGUAGE)
+    }
+}
+
+impl LanguageProfile {
+    pub fn for_language(lang: &str) -> Self {
+        let code = if lang.trim().to_lowercase().starts_with("en") {
+            "en"
+        } else {
+            "es"
+        };
+        if code == "en" {
+            Self {
+                code: "en".to_string(),
+                dialogue_open: "“".to_string(),
+                dialogue_close: "”".to_string(),
+                thought_open: "«".to_string(),
+                thought_close: "»".to_string(),
+                technique_open: "《".to_string(),
+                technique_close: "》".to_string(),
+                system_open: "[".to_string(),
+                system_close: "]".to_string(),
+                use_em_dash_dialogue: false,
+            }
+        } else {
+            Self {
+                code: "es".to_string(),
+                dialogue_open: "—".to_string(),
+                dialogue_close: String::new(),
+                thought_open: "«".to_string(),
+                thought_close: "»".to_string(),
+                technique_open: "《".to_string(),
+                technique_close: "》".to_string(),
+                system_open: "[".to_string(),
+                system_close: "]".to_string(),
+                use_em_dash_dialogue: true,
+            }
+        }
+    }
+}
+
+pub fn detect_language_from_pages(pages: &[PdfPageData]) -> &'static str {
+    let mut sample = String::new();
+    for page in pages.iter().take(20) {
+        for b in &page.blocks {
+            if b.block_type != 0 {
+                continue;
+            }
+            for l in &b.lines {
+                for s in &l.spans {
+                    sample.push_str(&s.text);
+                    sample.push(' ');
+                }
+            }
+        }
+        if sample.len() >= 12000 {
+            break;
+        }
+    }
+    crate::text_utils::detect_language_from_text(&sample)
+}
+
+pub fn resolve_language(requested: &str, text_sample: &str, preset_id: &str) -> &'static str {
+    let req = requested.trim().to_lowercase();
+    if req == "en" || req == "english" || req.starts_with("en-") {
+        return "en";
+    }
+    if req == "es" || req == "spanish" || req.starts_with("es-") {
+        return "es";
+    }
+    let (es_score, en_score) = crate::text_utils::count_language_stopwords(text_sample);
+    if en_score > es_score {
+        "en"
+    } else if es_score > en_score {
+        "es"
+    } else if preset_id.trim().to_lowercase().starts_with("en-") {
+        "en"
+    } else {
+        "es"
+    }
+}
 
 pub const CHAPTER_PATTERNS: &[&str] = &[
     r"^Cap[íi]tulo\s+\d+",
@@ -207,6 +403,7 @@ pub struct DocumentProfile {
     pub recurring_noise_signatures: HashSet<String>,
     pub learned_proper_nouns: Vec<(Regex, String)>,
     pub learned_titled_phrases: Vec<(Regex, String)>,
+    pub language: String,
 }
 
 struct ProfileRegexes {
@@ -288,6 +485,14 @@ pub fn infer_series_and_volume(filename: &str) -> (String, usize) {
 
 impl DocumentProfile {
     pub fn from_pages(pages: &[PdfPageData], filename: &str) -> Self {
+        Self::from_pages_with_language(pages, filename, LANGUAGE)
+    }
+
+    pub fn from_pages_with_language(
+        pages: &[PdfPageData],
+        filename: &str,
+        language: &str,
+    ) -> Self {
         let rx = get_profile_regexes();
         let (inferred_series_title, volume_number) = infer_series_and_volume(filename);
 
@@ -517,7 +722,7 @@ impl DocumentProfile {
 
         let mut learned_proper_nouns = Vec::new();
         for (low, forms) in proper_word_counts {
-            if crate::text_utils::is_stopword(&low, LANGUAGE) {
+            if crate::text_utils::is_stopword(&low, language) {
                 continue;
             }
             let total_cap: usize = forms.values().sum();
@@ -571,6 +776,7 @@ impl DocumentProfile {
             recurring_noise_signatures,
             learned_proper_nouns,
             learned_titled_phrases,
+            language: language.to_string(),
         }
     }
 

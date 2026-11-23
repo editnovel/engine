@@ -7,9 +7,11 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use pdf_oxide::content::{parse_content_stream, Matrix, Operator, TextElement};
 use pdf_oxide::crypto::{CryptoProvider, HashAlgorithm, RustCryptoProvider};
 use pdf_oxide::fonts::cmap::LazyCMap;
+#[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 const WIN_ANSI_TABLE: [char; 256] = [
     '\u{0000}', '\u{0001}', '\u{0002}', '\u{0003}', '\u{0004}', '\u{0005}', '\u{0006}', '\u{0007}',
@@ -103,18 +105,29 @@ impl ParsedPdfDocument {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let doc = Document::load_mem(bytes).map_err(|e| format!("PDF load error: {}", e))?;
         let page_map = doc.get_pages();
-        let mut pages = Vec::with_capacity(page_map.len());
-        let mut font_cache: HashMap<ObjectId, Rc<FontInfo>> = HashMap::new();
+        let page_ids: Vec<ObjectId> = page_map.values().copied().collect();
+        let font_cache: RwLock<HashMap<ObjectId, Arc<FontInfo>>> = RwLock::new(HashMap::new());
 
-        for (_, &page_id) in &page_map {
-            let page_data = extract_single_page(&doc, page_id, &mut font_cache);
-            pages.push(page_data);
-        }
+        #[cfg(any(feature = "parallel", not(target_arch = "wasm32")))]
+        let pages: Vec<PdfPageData> = page_ids
+            .par_iter()
+            .map(|&page_id| extract_single_page(&doc, page_id, &font_cache))
+            .collect();
+
+        #[cfg(all(not(feature = "parallel"), target_arch = "wasm32"))]
+        let pages: Vec<PdfPageData> = page_ids
+            .iter()
+            .map(|&page_id| extract_single_page(&doc, page_id, &font_cache))
+            .collect();
 
         Ok(Self {
             pages,
             raw_doc: doc,
         })
+    }
+
+    pub fn detect_scanned_pages(&self) -> Vec<usize> {
+        detect_scanned_pages_from_pages(&self.pages, Some(&self.raw_doc))
     }
 
     pub fn extract_xref_image(&self, xref: u32) -> Option<PdfExtractedXrefImage> {
@@ -547,11 +560,11 @@ enum StreamEvent {
 fn extract_single_page(
     doc: &Document,
     page_id: ObjectId,
-    font_cache: &mut HashMap<ObjectId, Rc<FontInfo>>,
+    font_cache: &RwLock<HashMap<ObjectId, Arc<FontInfo>>>,
 ) -> PdfPageData {
     let (page_width, page_height) = get_page_dimensions(doc, page_id);
 
-    let mut page_fonts: HashMap<String, Rc<FontInfo>> = HashMap::new();
+    let mut page_fonts: HashMap<String, Arc<FontInfo>> = HashMap::new();
     let mut xobject_order: Vec<(String, u32)> = Vec::new();
     let mut xobject_rects: HashMap<u32, Vec<(f64, f64, f64, f64)>> = HashMap::new();
 
@@ -563,22 +576,30 @@ fn extract_single_page(
                         let key_str = String::from_utf8_lossy(k).to_string();
                         match v {
                             Object::Reference(fid) => {
-                                let fi = font_cache
-                                    .entry(*fid)
-                                    .or_insert_with(|| {
-                                        Rc::new(
-                                            doc.get_object(*fid)
-                                                .ok()
-                                                .and_then(|o| o.as_dict().ok())
-                                                .map(|d| parse_font(doc, d))
-                                                .unwrap_or_default(),
-                                        )
-                                    })
-                                    .clone();
+                                let cached = font_cache
+                                    .read()
+                                    .ok()
+                                    .and_then(|guard| guard.get(fid).cloned());
+                                let fi = if let Some(existing) = cached {
+                                    existing
+                                } else {
+                                    let parsed = Arc::new(
+                                        doc.get_object(*fid)
+                                            .ok()
+                                            .and_then(|o| o.as_dict().ok())
+                                            .map(|d| parse_font(doc, d))
+                                            .unwrap_or_default(),
+                                    );
+                                    if let Ok(mut guard) = font_cache.write() {
+                                        guard.entry(*fid).or_insert_with(|| parsed.clone()).clone()
+                                    } else {
+                                        parsed
+                                    }
+                                };
                                 page_fonts.insert(key_str, fi);
                             }
                             Object::Dictionary(fd) => {
-                                page_fonts.insert(key_str, Rc::new(parse_font(doc, fd)));
+                                page_fonts.insert(key_str, Arc::new(parse_font(doc, fd)));
                             }
                             _ => {}
                         }
@@ -1190,4 +1211,72 @@ pub fn md5_hex(data: &[u8]) -> String {
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect()
+}
+
+pub fn page_char_count(page: &PdfPageData) -> usize {
+    let mut text = String::new();
+    for b in &page.blocks {
+        if b.block_type != 0 {
+            continue;
+        }
+        for l in &b.lines {
+            for s in &l.spans {
+                text.push_str(&s.text);
+            }
+        }
+    }
+    text.trim().chars().count()
+}
+
+pub fn page_has_large_image(page: &PdfPageData, doc: Option<&Document>) -> bool {
+    if page.image_refs.is_empty() {
+        return false;
+    }
+    let min_rect_w = (page.width * 0.35).min(200.0).max(120.0);
+    let min_rect_h = (page.height * 0.35).min(200.0).max(120.0);
+
+    for img_ref in &page.image_refs {
+        for &(x0, y0, x1, y1) in &img_ref.rects {
+            if (x1 - x0).abs() >= min_rect_w && (y1 - y0).abs() >= min_rect_h {
+                return true;
+            }
+        }
+        if let Some(d) = doc {
+            if let Ok(obj) = d.get_object((img_ref.xref, 0)) {
+                if let Ok(stream) = obj.as_stream() {
+                    let w = stream
+                        .dict
+                        .get(b"Width")
+                        .ok()
+                        .and_then(obj_as_f64)
+                        .unwrap_or(0.0);
+                    let h = stream
+                        .dict
+                        .get(b"Height")
+                        .ok()
+                        .and_then(obj_as_f64)
+                        .unwrap_or(0.0);
+                    if w >= 250.0 && h >= 250.0 {
+                        return true;
+                    }
+                }
+            }
+        } else if img_ref.rects.is_empty() && img_ref.xref > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn detect_scanned_pages_from_pages(
+    pages: &[PdfPageData],
+    doc: Option<&Document>,
+) -> Vec<usize> {
+    let mut scanned = Vec::new();
+    for (idx, page) in pages.iter().enumerate() {
+        if page_char_count(page) < 30 && page_has_large_image(page, doc) {
+            scanned.push(idx + 1);
+        }
+    }
+    scanned
 }

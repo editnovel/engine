@@ -101,6 +101,38 @@ pub fn is_stopword(word: &str, lang: &str) -> bool {
     }
 }
 
+pub fn count_language_stopwords(text: &str) -> (usize, usize) {
+    let mut es_score = 0usize;
+    let mut en_score = 0usize;
+    for raw_token in text.split(|c: char| !c.is_alphabetic() && c != '\'' && c != '’') {
+        let token = raw_token.trim_matches(|c: char| c == '\'' || c == '’');
+        if token.len() < 2 {
+            continue;
+        }
+        let lower = token.to_lowercase().replace('’', "'");
+        let in_es = SPANISH_STOPWORDS.binary_search(&lower.as_str()).is_ok();
+        let in_en = ENGLISH_STOPWORDS.binary_search(&lower.as_str()).is_ok();
+        if in_es && !in_en {
+            es_score += 2;
+        } else if in_en && !in_es {
+            en_score += 2;
+        } else if in_es && in_en {
+            es_score += 1;
+            en_score += 1;
+        }
+    }
+    (es_score, en_score)
+}
+
+pub fn detect_language_from_text(text: &str) -> &'static str {
+    let (es_score, en_score) = count_language_stopwords(text);
+    if en_score > es_score {
+        "en"
+    } else {
+        "es"
+    }
+}
+
 pub fn collapse_whitespace(text: &str) -> String {
     let trimmed = text.trim();
     if !trimmed.contains(char::is_whitespace) {

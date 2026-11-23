@@ -1,17 +1,20 @@
 use crate::cleaner::TextCleaner;
 use crate::config::{
-    infer_series_and_volume, DocumentProfile, ENABLE_DROP_CAPS, FOOTNOTE_STYLE,
-    FULL_PAGE_ILLUSTRATIONS, LANGUAGE,
+    detect_language_from_pages, infer_series_and_volume, resolve_language, DocumentProfile,
+    LanguageProfile, ParseOptions, PresetProfile, LANGUAGE,
 };
 use crate::detector::ChapterDetector;
 use crate::image_classifier::HybridImageClassifier;
-use crate::models::{ContentItem, ContentItemPayload, ExtractedImage, Paragraph, Section, VolumeInfo};
+use crate::models::{
+    ContentItem, ContentItemPayload, ExtractedImage, Paragraph, PdfPageData, Section, VolumeInfo,
+};
 use crate::pdf_extractor::ParsedPdfDocument;
 use crate::spell_corrector::ContextualSpellCorrector;
 use crate::templates::{
     classify_section_type, render_colophon, render_custom_section_xhtml, render_full_image,
     render_nav, render_section, render_title_page, EPUB_CSS,
 };
+use lol_html::{element, html_content::ContentType, rewrite_str, RewriteStrSettings};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
@@ -75,12 +78,6 @@ struct StaticRegexes {
     synopsis_title_re: Regex,
     synopsis_prefix_re: Regex,
     synopsis_alone_re: Regex,
-    img_tag_re: Regex,
-    br_tag_re: Regex,
-    hr_tag_re: Regex,
-    input_tag_re: Regex,
-    wbr_tag_re: Regex,
-    noteref_span_re: Regex,
 }
 
 static STATIC_REGEXES: OnceLock<StaticRegexes> = OnceLock::new();
@@ -96,15 +93,6 @@ fn get_static_regexes() -> &'static StaticRegexes {
         )
         .unwrap(),
         synopsis_alone_re: Regex::new(r"(?i)^(?:sinopsis|synopsis|argumento)$").unwrap(),
-        img_tag_re: Regex::new(r"<img\b([^>]*?[^/])>").unwrap(),
-        br_tag_re: Regex::new(r"<br\b([^>]*?[^/])>").unwrap(),
-        hr_tag_re: Regex::new(r"<hr\b([^>]*?[^/])>").unwrap(),
-        input_tag_re: Regex::new(r"<input\b([^>]*?[^/])>").unwrap(),
-        wbr_tag_re: Regex::new(r"<wbr\b([^>]*?[^/])>").unwrap(),
-        noteref_span_re: Regex::new(
-            r#"(?s)<span\b[^>]*class=["'][^"']*noteref[^"']*["'][^>]*?(?:data-fn-id=["']fn-(\d+)["']|id=["']fnref-(\d+)["'])[^>]*>(.*?)</span>"#,
-        )
-        .unwrap(),
     })
 }
 
@@ -154,6 +142,8 @@ pub struct EpubBuilder {
     pub detector: ChapterDetector,
     pub spell_corrector: ContextualSpellCorrector,
     pub image_classifier: HybridImageClassifier,
+    pub language: String,
+    pub preset: PresetProfile,
     multi_colon_re: Regex,
     colon_space_re: Regex,
     part_one_re: Regex,
@@ -187,12 +177,14 @@ impl EpubBuilder {
             detector: ChapterDetector::new(),
             spell_corrector: ContextualSpellCorrector::new(2),
             image_classifier: HybridImageClassifier::new(),
+            language: LANGUAGE.to_string(),
+            preset: PresetProfile::default(),
             multi_colon_re: Regex::new(r":+:").unwrap(),
             colon_space_re: Regex::new(r"\s*:\s*").unwrap(),
             part_one_re: Regex::new(r"(?i)^(?:Parte|Part)\s+(?:1|I)\.?$").unwrap(),
             norm_h_re: Regex::new(r"[\W_]+").unwrap(),
             init_heading_re: Regex::new(
-                r"(?i)^(?:cap[íi]tulo\s+(?:\d+|final(?:\s+[a-z])?)|pr[óo]logo|ep[íi]logo(?:\s+del\s+autor)?|interludio|intermisi[óo]n|palabras\s+(?:del\s+autor|finales|de\s+cierre)|posfacio|afterword|autor|resumen\s+(?:de\s+lo\s+ocurrido\s+)?hasta\s+ahora)$",
+                r"(?i)^(?:cap[íi]tulo\s+(?:\d+|final(?:\s+[a-z])?)|chapter\s+\d+|pr[óo]logo|prologue|ep[íi]logo(?:\s+del\s+autor)?|epilogue|interludio|interlude|intermisi[óo]n|palabras\s+(?:del\s+autor|finales|de\s+cierre)|posfacio|afterword|autor|resumen\s+(?:de\s+lo\s+ocurrido\s+)?hasta\s+ahora)$",
             )
             .unwrap(),
             non_narrative_sec_re: Regex::new(
@@ -212,6 +204,38 @@ impl EpubBuilder {
             custom_copyright_notice: None,
             custom_translator: None,
         }
+    }
+
+    pub fn with_options(options: &ParseOptions) -> Self {
+        let mut builder = Self::new();
+        let resolved_lang = resolve_language(&options.language, "", &options.preset_id);
+        let preset = PresetProfile::from_id(&options.preset_id);
+        let lang_profile = LanguageProfile::for_language(resolved_lang);
+        builder.language = resolved_lang.to_string();
+        builder.preset = preset.clone();
+        builder.cleaner.set_profiles(lang_profile, preset);
+        builder
+    }
+
+    pub fn configure_for_pages(&mut self, pages: &[PdfPageData], options: &ParseOptions) {
+        let req = options.language.trim().to_lowercase();
+        let resolved_lang = if req == "en" || req == "english" || req.starts_with("en-") {
+            "en"
+        } else if req == "es" || req == "spanish" || req.starts_with("es-") {
+            "es"
+        } else {
+            let detected = detect_language_from_pages(pages);
+            if detected == "en" || options.preset_id.trim().to_lowercase().starts_with("en-") {
+                detected
+            } else {
+                "es"
+            }
+        };
+        let preset = PresetProfile::from_id(&options.preset_id);
+        let lang_profile = LanguageProfile::for_language(resolved_lang);
+        self.language = resolved_lang.to_string();
+        self.preset = preset.clone();
+        self.cleaner.set_profiles(lang_profile, preset);
     }
 
     pub fn process_pdf_bytes(
@@ -235,15 +259,7 @@ impl EpubBuilder {
             .and_then(|s| s.to_str())
             .unwrap_or(filename);
 
-        let profile = DocumentProfile::from_pages(&doc.pages, base_name);
-        let vol_num = profile.volume_number;
-        let series_title = self
-            .custom_series_title
-            .as_deref()
-            .unwrap_or(&profile.inferred_series_title);
-        let vol_title = format!("{} - Volumen {:02}", series_title, vol_num);
-
-        let (cover, color_inserts, page_images, all_verdicts) = if extract_images {
+        let extracted_imgs = if extract_images {
             let (cover_list, inserts, p_imgs, verdicts) = self
                 .image_classifier
                 .classify_and_filter_document(doc, base_name);
@@ -251,14 +267,53 @@ impl EpubBuilder {
                 .first()
                 .cloned()
                 .or_else(|| inserts.first().cloned());
-            (cov, inserts, p_imgs, verdicts)
+            Some((cov, inserts, p_imgs, verdicts))
         } else {
-            (None, Vec::new(), HashMap::new(), Vec::new())
+            None
         };
+
+        let (extracted_publisher, extracted_description) = doc.extract_pdf_metadata();
+        self.process_pdf_pages(
+            &doc.pages,
+            filename,
+            extracted_imgs,
+            extracted_publisher,
+            extracted_description,
+        )
+    }
+
+    pub fn process_pdf_pages(
+        &mut self,
+        pages: &[PdfPageData],
+        filename: &str,
+        extracted_imgs: Option<(
+            Option<ExtractedImage>,
+            Vec<ExtractedImage>,
+            HashMap<usize, Vec<ExtractedImage>>,
+            Vec<ExtractedImage>,
+        )>,
+        extracted_publisher: Option<String>,
+        mut extracted_description: Option<String>,
+    ) -> VolumeInfo {
+        let base_name = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
+
+        let profile = DocumentProfile::from_pages_with_language(pages, base_name, &self.language);
+        let vol_num = profile.volume_number;
+        let series_title = self
+            .custom_series_title
+            .as_deref()
+            .unwrap_or(&profile.inferred_series_title);
+        let vol_title = format!("{} - Volumen {:02}", series_title, vol_num);
+
+        let (cover, color_inserts, page_images, all_verdicts) =
+            extracted_imgs.unwrap_or_else(|| (None, Vec::new(), HashMap::new(), Vec::new()));
 
         let (total_pages, raw_sections_list) = self
             .cleaner
-            .extract_raw_sections_with_profile(&doc.pages, &self.detector, &profile);
+            .extract_raw_sections_with_profile(pages, &self.detector, &profile);
         let mut sections: Vec<Section> = Vec::with_capacity(raw_sections_list.len());
         let mut all_spell_transforms = Vec::new();
 
@@ -277,12 +332,13 @@ impl EpubBuilder {
                 stitched_pairs.into_iter().map(|(_, p)| p).collect();
 
             let start_idx = all_spell_transforms.len() + 1;
+            let apply_es_auto_fixes = self.language == "es";
             let transforms = self.spell_corrector.analyze_and_correct_paragraphs(
                 &mut sec_paras,
                 vol_num,
                 sec.start_page,
                 &sec.title,
-                true,
+                apply_es_auto_fixes,
                 start_idx,
             );
             all_spell_transforms.extend(transforms);
@@ -334,7 +390,7 @@ impl EpubBuilder {
                                 .iter()
                                 .any(|c| c.filename == img.filename && c.page_num == img.page_num);
                             if !is_cov && !is_col {
-                                let item_t = if FULL_PAGE_ILLUSTRATIONS {
+                                let item_t = if self.preset.full_page_illustrations {
                                     "full_illustration"
                                 } else {
                                     "image"
@@ -352,7 +408,6 @@ impl EpubBuilder {
             sections.push(sec);
         }
 
-        let (extracted_publisher, mut extracted_description) = doc.extract_pdf_metadata();
         if extracted_description.is_none() {
             extracted_description = detect_synopsis_from_sections(&sections);
         }
@@ -555,7 +610,7 @@ impl EpubBuilder {
         }
 
         let title_html = render_title_page(
-            LANGUAGE,
+            &self.language,
             &volume.volume_number.to_string(),
             &html_escape(&volume.title),
         );
@@ -664,7 +719,7 @@ impl EpubBuilder {
                 html_escape(illustrator)
             };
             let col_html = render_colophon(
-                LANGUAGE,
+                &self.language,
                 &html_escape(&volume.title),
                 &html_escape(author),
                 &ill,
@@ -811,7 +866,7 @@ impl EpubBuilder {
 
             let title_page_id = format!("{}_title_page", v_prefix);
             let title_page_href = format!("Text/{}_title.xhtml", v_prefix);
-            let title_html = render_title_page(LANGUAGE, &v_num_str, &series_title);
+            let title_html = render_title_page(&self.language, &v_num_str, &series_title);
             html_files.push((format!("OEBPS/{}", title_page_href), title_html));
             manifest_items.push(ManifestItem {
                 id: title_page_id.clone(),
@@ -942,7 +997,7 @@ impl EpubBuilder {
                 html_escape(illustrator)
             };
             let global_col_html = render_colophon(
-                LANGUAGE,
+                &self.language,
                 &html_escape(&global_title),
                 &html_escape(author),
                 &ill,
@@ -1131,7 +1186,7 @@ impl EpubBuilder {
         height: u32,
     ) -> String {
         let safe_title = html_escape(title);
-        render_full_image(LANGUAGE, &safe_title, width, height, filename)
+        render_full_image(&self.language, &safe_title, width, height, filename)
     }
 
     pub fn build_section_parts_custom(&self, sec: &Section, prefix: &str) -> RenderedSectionParts {
@@ -1269,7 +1324,7 @@ impl EpubBuilder {
                     if is_first_in_block {
                         css_classes.push("first-paragraph");
                         if !has_narrative_started
-                            && ENABLE_DROP_CAPS
+                            && self.preset.enable_drop_caps
                             && is_narrative_section
                             && p.style == "narrative"
                             && plain_trimmed.chars().count() >= 90
@@ -1297,7 +1352,7 @@ impl EpubBuilder {
                     has_narrative_started = true;
                 }
 
-                if FOOTNOTE_STYLE == "callout_card" && !p.footnotes.is_empty() {
+                if self.preset.footnote_style == "callout_card" && !p.footnotes.is_empty() {
                     for fn_item in &p.footnotes {
                         let esc_fn = html_escape(&fn_item.text);
                         body_parts.push(format!(
@@ -1309,7 +1364,7 @@ impl EpubBuilder {
             }
         }
 
-        if FOOTNOTE_STYLE == "end_of_chapter" && !sec.footnotes.is_empty() {
+        if self.preset.footnote_style == "end_of_chapter" && !sec.footnotes.is_empty() {
             let mut fn_parts: Vec<String> = Vec::new();
             fn_parts.push("  <section class=\"chapter-footnotes\" epub:type=\"footnotes\">".to_string());
             fn_parts.push("    <hr class=\"footnotes-divider\" />".to_string());
@@ -1350,11 +1405,11 @@ impl EpubBuilder {
         });
         if let Some(ref custom_html) = sec.custom_html {
             let sanitized = sanitize_html_for_xhtml(custom_html);
-            return render_custom_section_xhtml(LANGUAGE, &html_escape(&sec.title), &sanitized, sec_type);
+            return render_custom_section_xhtml(&self.language, &html_escape(&sec.title), &sanitized, sec_type);
         }
         let parts = self.build_section_parts_custom(sec, prefix);
         render_section(
-            LANGUAGE,
+            &self.language,
             &parts.safe_title,
             &parts.main_heading,
             &parts.sub_heading_block,
@@ -1388,7 +1443,7 @@ impl EpubBuilder {
             .collect();
         let landmarks_str = landmarks_items.join("\n");
 
-        render_nav(LANGUAGE, &safe_vol_title, &items.join("\n"), &landmarks_str)
+        render_nav(&self.language, &safe_vol_title, &items.join("\n"), &landmarks_str)
     }
 
     fn render_toc_node_html(&self, node: &TocNode, indent: usize) -> String {
@@ -1588,11 +1643,11 @@ impl EpubBuilder {
 
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"book-id\" xml:lang=\"{}\">\n  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n    <dc:identifier id=\"book-id\">{}</dc:identifier>{}\n    <dc:title>{}</dc:title>\n    <dc:language>{}</dc:language>\n    <dc:creator>{}</dc:creator>{}{}{}{}{}\n    <meta property=\"dcterms:modified\">2026-09-12T00:00:00Z</meta>\n  </metadata>\n  <manifest>\n{}\n  </manifest>\n  <spine toc=\"ncx\">\n{}\n  </spine>\n</package>",
-            LANGUAGE,
+            &self.language,
             uid,
             isbn_tag,
             html_escape(title),
-            LANGUAGE,
+            &self.language,
             author_escaped,
             translator_tag,
             pub_tag,
@@ -1636,28 +1691,53 @@ impl EpubBuilder {
 }
 
 pub fn sanitize_html_for_xhtml(html: &str) -> String {
-    let rx = get_static_regexes();
-    let mut out = html.replace("&nbsp;", "&#160;");
-    out = rx.img_tag_re.replace_all(&out, "<img$1 />").to_string();
-    out = rx.br_tag_re.replace_all(&out, "<br$1 />").to_string();
-    out = rx.hr_tag_re.replace_all(&out, "<hr$1 />").to_string();
-    out = rx.input_tag_re.replace_all(&out, "<input$1 />").to_string();
-    out = rx.wbr_tag_re.replace_all(&out, "<wbr$1 />").to_string();
-    out = rx
-        .noteref_span_re
-        .replace_all(&out, |caps: &regex::Captures| {
-            let fn_num = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .map(|m| m.as_str())
-                .unwrap_or("1");
-            let inner = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            format!(
-                "<a href=\"#fn-{fn_num}\" id=\"fnref-{fn_num}\" class=\"noteref\" epub:type=\"noteref\" role=\"doc-noteref\">{inner}</a>"
-            )
-        })
-        .to_string();
-    out
+    let normalized = html.replace("&nbsp;", "&#160;");
+    let settings = RewriteStrSettings::new()
+        .append_element_content_handler(element!("span.noteref", |el| {
+            let fn_num = el
+                .get_attribute("data-fn-id")
+                .and_then(|v| {
+                    v.strip_prefix("fn-")
+                        .map(|s| s.to_string())
+                        .or(Some(v))
+                })
+                .or_else(|| {
+                    el.get_attribute("id").and_then(|v| {
+                        v.strip_prefix("fnref-")
+                            .map(|s| s.to_string())
+                            .or(Some(v))
+                    })
+                })
+                .unwrap_or_else(|| "1".to_string());
+            let _ = el.set_tag_name("a");
+            el.remove_attribute("data-fn-id");
+            el.remove_attribute("href");
+            el.remove_attribute("id");
+            el.remove_attribute("class");
+            el.remove_attribute("epub:type");
+            el.remove_attribute("role");
+            let _ = el.set_attribute("href", &format!("#fn-{fn_num}"));
+            let _ = el.set_attribute("id", &format!("fnref-{fn_num}"));
+            let _ = el.set_attribute("class", "noteref");
+            let _ = el.set_attribute("epub:type", "noteref");
+            let _ = el.set_attribute("role", "doc-noteref");
+            Ok(())
+        }))
+        .append_element_content_handler(element!("img, br, hr, input, wbr", |el| {
+            let tag = el.tag_name();
+            let mut rebuilt = format!("<{}", tag);
+            for attr in el.attributes() {
+                let name = attr.name();
+                if name == "/" {
+                    continue;
+                }
+                rebuilt.push_str(&format!(" {}=\"{}\"", name, html_escape(&attr.value())));
+            }
+            rebuilt.push_str(" />");
+            el.replace(&rebuilt, ContentType::Html);
+            Ok(())
+        }));
+    rewrite_str(&normalized, settings).unwrap_or(normalized)
 }
 
 pub fn html_escape(s: &str) -> String {

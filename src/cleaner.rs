@@ -1,7 +1,8 @@
 use crate::config::{
     DEFAULT_DELIMITER_HIERARCHY, DelimiterHierarchySpec, DelimiterLevel, DocumentProfile,
-    HEADER_NOISE_PATTERNS, LEVEL5_TRIPLE_BAR, SCENE_BREAK_PATTERNS, STITCHABLE_DELIMITER_PAIRS,
-    SUBSECTION_PATTERNS, normalize_cjk_delimiter_variants,
+    HEADER_NOISE_PATTERNS, LEVEL5_TRIPLE_BAR, LanguageProfile, PresetProfile,
+    SCENE_BREAK_PATTERNS, STITCHABLE_DELIMITER_PAIRS, SUBSECTION_PATTERNS,
+    normalize_cjk_delimiter_variants,
 };
 use crate::detector::ChapterDetector;
 use crate::models::{Footnote, Paragraph, PdfPageData, Section};
@@ -20,6 +21,8 @@ struct RawLineInfo {
 }
 
 pub struct TextCleaner {
+    pub language_profile: LanguageProfile,
+    pub preset_profile: PresetProfile,
     noise_set: RegexSet,
     scene_set: RegexSet,
     subsection_set: RegexSet,
@@ -119,6 +122,8 @@ impl TextCleaner {
             .collect();
 
         Self {
+            language_profile: LanguageProfile::default(),
+            preset_profile: PresetProfile::default(),
             noise_set: RegexSet::new(noise_pats).unwrap(),
             scene_set: RegexSet::new(SCENE_BREAK_PATTERNS).unwrap(),
             subsection_set: RegexSet::new(sub_pats).unwrap(),
@@ -234,6 +239,25 @@ impl TextCleaner {
             ast_word_target_re: Regex::new(r"([A-Za-zÀ-ÿ0-9》』”\])])(\*+)").unwrap(),
             mid_quote_space_re: Regex::new(r#"[”"]\s+\S"#).unwrap(),
         }
+    }
+
+    pub fn with_profiles(
+        language_profile: LanguageProfile,
+        preset_profile: PresetProfile,
+    ) -> Self {
+        let mut cleaner = Self::new();
+        cleaner.language_profile = language_profile;
+        cleaner.preset_profile = preset_profile;
+        cleaner
+    }
+
+    pub fn set_profiles(
+        &mut self,
+        language_profile: LanguageProfile,
+        preset_profile: PresetProfile,
+    ) {
+        self.language_profile = language_profile;
+        self.preset_profile = preset_profile;
     }
 
     pub fn extract_raw_sections(
@@ -416,6 +440,9 @@ impl TextCleaner {
     }
 
     pub fn is_scene_break(&self, line: &str) -> bool {
+        if !self.preset_profile.enable_scene_breaks {
+            return false;
+        }
         let stripped = crate::text_utils::strip_formatting_tokens(line);
         let trimmed = stripped.trim();
         self.scene_set.is_match(trimmed)
@@ -899,7 +926,15 @@ impl TextCleaner {
         if self.dialogue_style_re.is_match(&clean_t) {
             return "dialogue".to_string();
         }
-        if clean_t.starts_with('[') && clean_t.ends_with(']') {
+        if !self.language_profile.use_em_dash_dialogue
+            && (clean_t.starts_with('“') || clean_t.starts_with('"'))
+        {
+            return "dialogue".to_string();
+        }
+        if self.preset_profile.enable_lit_rpg_brackets
+            && clean_t.starts_with('[')
+            && clean_t.ends_with(']')
+        {
             return "bracket_speech".to_string();
         }
         if clean_t.starts_with('«') && clean_t.ends_with('»') {
@@ -1456,12 +1491,18 @@ impl TextCleaner {
         &DEFAULT_DELIMITER_HIERARCHY
     }
 
-    pub const fn canonical_delimiters_for_level(
+    pub fn canonical_delimiters_for_level(
         &self,
         level: DelimiterLevel,
     ) -> (&'static str, &'static str) {
         match level {
-            DelimiterLevel::Level1SpokenDialogue => ("—", ""),
+            DelimiterLevel::Level1SpokenDialogue => {
+                if self.language_profile.use_em_dash_dialogue {
+                    ("—", "")
+                } else {
+                    ("“", "”")
+                }
+            }
             DelimiterLevel::Level2MediatedThoughtCite => ("«", "»"),
             DelimiterLevel::Level3TechniqueSkillSystem => ("《", "》"),
             DelimiterLevel::Level4InterfaceStatusLocation => ("[", "]"),
@@ -1539,18 +1580,81 @@ impl TextCleaner {
             }
         }
 
-        s = self.unify_level1_spoken_dialogue(s);
-        s = self.unify_level2_mediated_thought_and_citations(s);
-        s = self.unify_level3_techniques_and_skills(s);
-        s = self.unify_level4_interface_brackets(s);
-        s = self.unify_level5_rhythm_and_pauses(s, current_style);
-        s = self.balance_residual_delimiters(s);
+        if !self.language_profile.use_em_dash_dialogue {
+            s = self.standardize_english_paragraph_text(s, current_style);
+        } else {
+            s = self.unify_level1_spoken_dialogue(s);
+            s = self.unify_level2_mediated_thought_and_citations(s);
+            s = self.unify_level3_techniques_and_skills(s);
+            s = self.unify_level4_interface_brackets(s);
+            s = self.unify_level5_rhythm_and_pauses(s, current_style);
+            s = self.balance_residual_delimiters(s);
+        }
 
         if !trail_tokens.is_empty() {
             s.push_str(&trail_tokens);
         }
 
         s
+    }
+
+    fn standardize_english_paragraph_text(&self, mut s: String, current_style: &str) -> String {
+        if s.starts_with('「') {
+            if let Some(caps) = self.kagi_dialogue_re.captures(&s) {
+                s = format!("“{}{}”", caps[1].trim(), &caps[2]);
+            } else {
+                let inner = s.trim_start_matches('「').trim_end_matches('」').trim();
+                s = format!("“{}”", inner);
+            }
+        } else if self.dialogue_style_re.is_match(&s) {
+            let stripped = self.dash_prefix_norm_re.replace(&s, "$1").trim().to_string();
+            s = format!("“{}”", stripped);
+        }
+
+        if s.contains('"') {
+            s = self
+                .straight_double_quote_re
+                .replace_all(&s, "“$1”")
+                .to_string();
+            if s.starts_with('"') {
+                s = format!("“{}", &s[1..]);
+            }
+            if s.ends_with('"') {
+                s.pop();
+                s.push('”');
+            }
+        }
+
+        if s.contains('『') || s.contains('』') {
+            s = s.replace('『', "«").replace('』', "»");
+        }
+        if s.starts_with('（') {
+            if let Some(caps) = self.fullwidth_paren_thought_re.captures(&s) {
+                s = format!("«{}»", caps[1].trim());
+            }
+        }
+
+        if self.preset_profile.enable_lit_rpg_brackets {
+            s = self.unify_level3_techniques_and_skills(s);
+            s = self.unify_level4_interface_brackets(s);
+        }
+        s = self.unify_level5_rhythm_and_pauses(s, current_style);
+
+        if s.starts_with('“') && s.matches('“').count() == 1 && s.matches('”').count() == 0 {
+            s.push('”');
+        }
+        if self.preset_profile.enable_lit_rpg_brackets {
+            if s.starts_with('[') && s.matches('[').count() == 1 && s.matches(']').count() == 0 {
+                s.push(']');
+            }
+            if s.matches('《').count() > s.matches('》').count() {
+                s = self
+                    .unclosed_angle_end_re
+                    .replace_all(&s, "《$1》")
+                    .to_string();
+            }
+        }
+        self.merge_bold_tokens(&s)
     }
 
     fn unify_level1_spoken_dialogue(&self, mut s: String) -> String {
