@@ -1,0 +1,50 @@
+name: Sync Engine Contracts and Dicts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - data/dicts_br/**
+      - src/config.rs
+      - src/contracts.rs
+      - src/lib.rs
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  export-and-dispatch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate contracts and dicts bundle
+        run: |
+          mkdir -p dist
+          cargo run --example export_contracts -- --manifest-out dist/engine-manifest.json --ts-out dist/engine-contracts.ts
+          tar -czf dist/dicts_br.tar.gz -C data/dicts_br .
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/engine-manifest.json
+            dist/engine-contracts.ts
+            dist/dicts_br.tar.gz
+      - name: Notify editnovel/portal
+        if: env.PORTAL_DISPATCH_TOKEN != ''
+        env:
+          PORTAL_DISPATCH_TOKEN: ${{ secrets.PORTAL_DISPATCH_TOKEN }}
+        run: |
+          MANIFEST_B64=$(base64 -w0 dist/engine-manifest.json)
+          TS_B64=$(base64 -w0 dist/engine-contracts.ts)
+          PAYLOAD=$(jq -n --arg m "$MANIFEST_B64" --arg t "$TS_B64" '{event_type: "engine-updated", client_payload: {manifest_b64: $m, contracts_ts_b64: $t}}')
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PORTAL_DISPATCH_TOKEN}" \
+            https://api.github.com/repos/editnovel/portal/dispatches \
+            -d "${PAYLOAD}"

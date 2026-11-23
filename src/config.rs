@@ -61,9 +61,9 @@ impl Default for PresetProfile {
 
 impl PresetProfile {
     pub fn from_id(raw_id: &str) -> Self {
-        let norm = raw_id.trim().to_lowercase();
-        match norm.as_str() {
-            "webnovel" | "en-litrpg" | "litrpg" => Self {
+        let resolved = crate::contracts::resolve_preset_id(raw_id).unwrap_or("visual-novel");
+        match resolved {
+            "webnovel" => Self {
                 id: "webnovel".to_string(),
                 enable_drop_caps: false,
                 enable_lit_rpg_brackets: true,
@@ -71,7 +71,7 @@ impl PresetProfile {
                 footnote_style: "callout_card".to_string(),
                 full_page_illustrations: true,
             },
-            "generic" | "en-fiction" | "fiction" => Self {
+            "generic" => Self {
                 id: "generic".to_string(),
                 enable_drop_caps: true,
                 enable_lit_rpg_brackets: false,

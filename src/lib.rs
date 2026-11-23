@@ -1,5 +1,6 @@
 pub mod cleaner;
 pub mod config;
+pub mod contracts;
 pub mod detector;
 pub mod epub_builder;
 pub mod image_classifier;
@@ -179,6 +180,10 @@ pub fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+pub fn engine_manifest_json() -> String {
+    crate::contracts::engine_manifest_json()
+}
+
 fn classify_section_type(title: &str) -> &'static str {
     crate::templates::classify_section_type(title)
 }
@@ -224,43 +229,13 @@ fn compute_detected_rules(vol: &VolumeInfo) -> Vec<FrontendEditorialRule> {
 
     let header_and_spell_count = vol.total_pages + vol.spell_transformations.len();
 
-    vec![
-        FrontendEditorialRule {
-            id: "rule-dialogue-dashes".to_string(),
-            label: "Standardize Dialogue Em-Dashes".to_string(),
-            description: "Replaces double hyphens and standard dashes in spoken lines with typographic em-dashes (—).".to_string(),
-            enabled: true,
-            affected_count: dash_count,
-        },
-        FrontendEditorialRule {
-            id: "rule-curly-quotes".to_string(),
-            label: "Smart Curly Quotes & Brackets".to_string(),
-            description: "Transforms straight quotation marks and angle brackets into curved or guillemet quotes (« » / “ ”).".to_string(),
-            enabled: true,
-            affected_count: quote_count,
-        },
-        FrontendEditorialRule {
-            id: "rule-ellipsis".to_string(),
-            label: "Typographic Ellipses".to_string(),
-            description: "Substitutes three dots (...) with a single horizontal ellipsis glyph (…).".to_string(),
-            enabled: true,
-            affected_count: ellipsis_count,
-        },
-        FrontendEditorialRule {
-            id: "rule-clean-breaks".to_string(),
-            label: "Consolidate Multiple Blank Lines & Breaks".to_string(),
-            description: "Removes unnecessary blank lines and preserves deliberate scene transitions.".to_string(),
-            enabled: true,
-            affected_count: break_count,
-        },
-        FrontendEditorialRule {
-            id: "rule-strip-headers".to_string(),
-            label: "Strip Running Headers, Page Numbers & OCR Fixes".to_string(),
-            description: "Strips repeated PDF page markers and applies contextual spell/OCR corrections.".to_string(),
-            enabled: true,
-            affected_count: header_and_spell_count,
-        },
-    ]
+    crate::contracts::default_editorial_rules_with_counts(
+        dash_count,
+        quote_count,
+        ellipsis_count,
+        break_count,
+        header_and_spell_count,
+    )
 }
 
 struct EpubParseRegexes {
